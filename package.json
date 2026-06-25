@@ -1,0 +1,13 @@
+{
+	"name": "botanime",
+	"private": true,
+	"dependencies": {
+		"discord.js": "^14.26.4",
+		"dotenv": "^17.4.2",
+		"googleapis": "^173.0.0"
+	},
+	"scripts": {
+		"dev": "node --watch Bot.js",
+		"deploy": "node deploy-commands.js"
+	}
+}
