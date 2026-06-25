@@ -1,8 +1,10 @@
 require('dotenv').config();
 const { REST, Routes } = require('discord.js');
 const temporada = require('./src/commands/temporada');
+const temporadaForo = require('./src/commands/temporadaForo');
+const avisos = require('./src/commands/avisos');
 
-const commands = [temporada.data.toJSON()];
+const commands = [temporada.data.toJSON(), temporadaForo.data.toJSON(), avisos.data.toJSON()];
 
 const rest = new REST().setToken(process.env.DISCORD_TOKEN);
 

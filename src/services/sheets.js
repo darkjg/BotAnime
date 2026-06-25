@@ -22,6 +22,24 @@ const SIGUEN_LABEL = 'CONTINUAN';
 const BLACK = { red: 0, green: 0, blue: 0 };
 const THIN_BLACK_BORDER = { style: 'SOLID', width: 1, color: BLACK };
 const THICK_BLACK_BORDER = { style: 'SOLID_THICK', width: 3, color: BLACK };
+const BROADCAST_DAY_ORDER = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo'];
+
+function broadcastDayRank(day) {
+	const index = BROADCAST_DAY_ORDER.indexOf(day);
+	return index === -1 ? BROADCAST_DAY_ORDER.length : index;
+}
+
+// Caché en memoria de "malId -> columna" por temporada, para no preguntarle a Sheets la misma
+// ubicación en cada click de navegación. Se invalida por temporada entera cuando se crea una
+// columna nueva (puede correr otras columnas hacia la derecha).
+const animeColumnCache = new Map();
+
+function invalidateColumnCache(seasonName) {
+	const prefix = `${seasonName}::`;
+	for (const key of animeColumnCache.keys()) {
+		if (key.startsWith(prefix)) animeColumnCache.delete(key);
+	}
+}
 
 const VOTE_STYLES = {
 	verde: { label: '0', color: { red: 0, green: 1, blue: 0 } },
@@ -66,19 +84,26 @@ async function findSheetByTitle(sheets, title) {
 }
 
 // El texto de la celda de título puede ser un apodo editado a mano; identificamos el anime por el
-// malId incrustado en la URL del HYPERLINK, no por el texto visible. startCol/endCol (exclusivo,
-// absolutos) acotan la lectura a un subgrupo de columnas; por defecto cubre toda la fila.
+// malId incrustado en el link, no por el texto visible. El link puede venir de: una fórmula
+// =HYPERLINK(...), un hyperlink de texto enriquecido que cubre toda la celda (cell.hyperlink), o un
+// hyperlink de texto enriquecido que cubre solo parte del texto (textFormatRuns[].format.link.uri —
+// pasa apenas el link no llega exactamente hasta el último carácter). values.get no devuelve nada de
+// esto, por eso usamos spreadsheets.get pidiendo los tres campos.
+// startCol/endCol (exclusivo, absolutos) acotan la lectura a un subgrupo de columnas; por defecto
+// cubre toda la fila.
 async function getMalIdsInRange(sheets, title, titleRow, startCol = FIRST_ANIME_COL_INDEX, endCol = Infinity) {
-	const res = await sheets.spreadsheets.values.get({
+	const res = await sheets.spreadsheets.get({
 		spreadsheetId: SPREADSHEET_ID,
-		range: `'${title}'!${titleRow}:${titleRow}`,
-		valueRenderOption: 'FORMULA',
+		ranges: [`'${title}'!${titleRow}:${titleRow}`],
+		fields: 'sheets.data.rowData.values(userEnteredValue.formulaValue,hyperlink,textFormatRuns.format.link.uri)',
 	});
-	const row = res.data.values?.[0] ?? [];
+	const row = res.data.sheets?.[0]?.data?.[0]?.rowData?.[0]?.values ?? [];
 	const malIds = [];
 	for (let col = startCol; col < Math.min(row.length, endCol); col += 2) {
-		const cell = row[col] ?? '';
-		const match = /myanimelist\.net\/anime\/(\d+)/.exec(cell);
+		const cell = row[col] ?? {};
+		const runLinks = (cell.textFormatRuns ?? []).map((run) => run.format?.link?.uri).filter(Boolean);
+		const sources = [cell.hyperlink, cell.userEnteredValue?.formulaValue, ...runLinks].filter(Boolean);
+		const match = sources.map((source) => /myanimelist\.net\/anime\/(\d+)/.exec(source)).find(Boolean);
 		malIds.push(match ? Number(match[1]) : null);
 	}
 	return malIds;
@@ -111,9 +136,25 @@ async function getUsersAndDayRow(sheets, title, userStart) {
 
 // Posición del bloque "continuación" en base a dónde terminó el bloque "nuevo". No escribe nada;
 // `exists` indica si su cabecera ya fue creada.
+//
+// Lo normal es que haya BLANK_ROWS_BETWEEN_BLOCKS filas vacías entre el día de emisión del bloque
+// "nuevo" y la etiqueta de "continuación", pero pestañas viejas (editadas a mano antes de que
+// existiera este espaciado) pueden tener menos o más filas de margen. En vez de asumir ese offset
+// fijo, buscamos la primera fila no vacía de la columna A cerca de donde debería estar.
 async function peekContinuacionLayout(sheets, title) {
 	const nuevo = await getUsersAndDayRow(sheets, title, NUEVO_USER_START);
-	const labelRow = nuevo.dayRowIndex + BLANK_ROWS_BETWEEN_BLOCKS + 1;
+	const defaultLabelRow = nuevo.dayRowIndex + BLANK_ROWS_BETWEEN_BLOCKS + 1;
+
+	const searchStart = nuevo.dayRowIndex + 1;
+	const searchEnd = defaultLabelRow + 3;
+	const res = await sheets.spreadsheets.values.get({
+		spreadsheetId: SPREADSHEET_ID,
+		range: `'${title}'!${columnLetter(NAME_COL_INDEX)}${searchStart}:${columnLetter(NAME_COL_INDEX)}${searchEnd}`,
+	});
+	const values = res.data.values ?? [];
+	const offset = values.findIndex((row) => (row[0] ?? '') !== '');
+	const labelRow = offset === -1 ? defaultLabelRow : searchStart + offset;
+
 	const imageRow = labelRow + 1;
 	const titleRow = imageRow + IMAGE_ROW_SPAN;
 	const userStart = titleRow + 1;
@@ -262,13 +303,14 @@ async function writeAnimeBlock(sheets, sheetId, title, anime, voteCol, imageRow,
 	});
 }
 
-// Envuelve todo el bloque "continuación" (secuelas + CONTINUAN) en un borde negro más grueso,
-// recalculando su ancho actual cada vez que se agrega una columna nueva.
+// Envuelve solo el subgrupo "CONTINUAN" en un borde negro más grueso, recalculando su ancho
+// actual cada vez que se agrega una columna nueva. Las secuelas no llevan este borde.
 async function applyContinuacionOuterBorder(sheets, sheetId, title, layout) {
 	const siguenStartCol = await findColumnWithLabel(sheets, title, layout.labelRow, SIGUEN_LABEL);
-	const secuelaMalIds = await getMalIdsInRange(sheets, title, layout.titleRow, FIRST_ANIME_COL_INDEX, siguenStartCol ?? Infinity);
-	const siguenMalIds = siguenStartCol !== null ? await getMalIdsInRange(sheets, title, layout.titleRow, siguenStartCol) : [];
-	const endColumnIndex = FIRST_ANIME_COL_INDEX + (secuelaMalIds.length + siguenMalIds.length) * 2;
+	if (siguenStartCol === null) return;
+
+	const siguenMalIds = await getMalIdsInRange(sheets, title, layout.titleRow, siguenStartCol);
+	const endColumnIndex = siguenStartCol + siguenMalIds.length * 2;
 
 	await sheets.spreadsheets.batchUpdate({
 		spreadsheetId: SPREADSHEET_ID,
@@ -280,7 +322,7 @@ async function applyContinuacionOuterBorder(sheets, sheetId, title, layout) {
 							sheetId,
 							startRowIndex: layout.labelRow - 1,
 							endRowIndex: layout.dayRowIndex,
-							startColumnIndex: FIRST_ANIME_COL_INDEX,
+							startColumnIndex: siguenStartCol,
 							endColumnIndex,
 						},
 						top: THICK_BLACK_BORDER,
@@ -365,6 +407,56 @@ async function ensureSeasonTab(seasonName) {
 	await writeLegendAndHeader(sheets, created.data.replies[0].addSheet.properties.sheetId, seasonName);
 }
 
+// Decide en qué columna absoluta debe escribirse un anime nuevo dentro de un subgrupo de `count`
+// animes ya existentes (columnas startCol, startCol+2, ...), comparando su día de emisión contra el
+// de cada uno ya escrito en `dayRowIndex`. Si ya hay alguno con un día "más tarde" en la semana,
+// devuelve esa columna con insertBefore=true para abrir espacio ahí; si no, se puede escribir al
+// final del subgrupo sin insertar nada.
+async function findSortedInsertionColumn(sheets, title, dayRowIndex, startCol, count, newDay) {
+	if (count === 0) return { col: startCol, insertBefore: false };
+
+	const res = await sheets.spreadsheets.values.get({
+		spreadsheetId: SPREADSHEET_ID,
+		range: `'${title}'!${dayRowIndex}:${dayRowIndex}`,
+	});
+	const row = res.data.values?.[0] ?? [];
+	const newRank = broadcastDayRank(newDay);
+
+	for (let i = 0; i < count; i += 1) {
+		const col = startCol + i * 2;
+		if (broadcastDayRank(row[col] ?? null) > newRank) return { col, insertBefore: true };
+	}
+	return { col: startCol + count * 2, insertBefore: false };
+}
+
+// inheritFromBefore: false NO deja las columnas nuevas en blanco — significa que heredan el formato
+// de la columna siguiente (la que estaba a la derecha del punto de inserción). Si esa columna tenía
+// color de fondo (la barra verde/naranja del voto), la columna recién insertada se queda con esa
+// mancha hasta que se le escribe contenido propio. Por eso limpiamos el formato explícitamente acá,
+// antes de que writeAnimeBlock/setVote escriban lo suyo.
+async function insertColumnsAt(sheets, sheetId, col) {
+	await sheets.spreadsheets.batchUpdate({
+		spreadsheetId: SPREADSHEET_ID,
+		requestBody: {
+			requests: [
+				{
+					insertDimension: {
+						range: { sheetId, dimension: 'COLUMNS', startIndex: col, endIndex: col + 2 },
+						inheritFromBefore: false,
+					},
+				},
+				{
+					repeatCell: {
+						range: { sheetId, startColumnIndex: col, endColumnIndex: col + 2 },
+						cell: { userEnteredFormat: {} },
+						fields: 'userEnteredFormat',
+					},
+				},
+			],
+		},
+	});
+}
+
 // Crea la columna de un anime si todavía no existe en su bloque/subgrupo (identificado por malId).
 // Devuelve { animeIndex: colIndex absoluto de su columna de voto, userStart: fila donde empiezan
 // los usuarios de ese bloque }.
@@ -381,10 +473,19 @@ async function ensureAnimeColumn(seasonName, anime) {
 		const existingIndex = malIds.indexOf(anime.malId);
 		if (existingIndex !== -1) return { animeIndex: FIRST_ANIME_COL_INDEX + existingIndex * 2, userStart: NUEVO_USER_START };
 
-		const targetCol = FIRST_ANIME_COL_INDEX + malIds.length * 2;
+		const { col: targetCol, insertBefore } = await findSortedInsertionColumn(
+			sheets,
+			seasonName,
+			dayRowIndex,
+			FIRST_ANIME_COL_INDEX,
+			malIds.length,
+			anime.broadcastDay,
+		);
+		if (insertBefore) await insertColumnsAt(sheets, sheet.properties.sheetId, targetCol);
 		await ensureColumnCapacity(sheets, sheet, targetCol);
 		const imageRow = NUEVO_TITLE_ROW - IMAGE_ROW_SPAN;
 		await writeAnimeBlock(sheets, sheet.properties.sheetId, seasonName, anime, targetCol, imageRow, NUEVO_TITLE_ROW, dayRowIndex);
+		invalidateColumnCache(seasonName);
 		return { animeIndex: targetCol, userStart: NUEVO_USER_START };
 	}
 
@@ -399,25 +500,24 @@ async function ensureAnimeColumn(seasonName, anime) {
 			return { animeIndex: FIRST_ANIME_COL_INDEX + existingIndex * 2, userStart: layout.userStart };
 		}
 
-		const targetCol = FIRST_ANIME_COL_INDEX + secuelaMalIds.length * 2;
-		if (siguenStartCol !== null && targetCol >= siguenStartCol) {
-			await sheets.spreadsheets.batchUpdate({
-				spreadsheetId: SPREADSHEET_ID,
-				requestBody: {
-					requests: [
-						{
-							insertDimension: {
-								range: { sheetId: sheet.properties.sheetId, dimension: 'COLUMNS', startIndex: siguenStartCol, endIndex: siguenStartCol + 2 },
-								inheritFromBefore: false,
-							},
-						},
-					],
-				},
-			});
+		const { col: targetCol, insertBefore } = await findSortedInsertionColumn(
+			sheets,
+			seasonName,
+			layout.dayRowIndex,
+			FIRST_ANIME_COL_INDEX,
+			secuelaMalIds.length,
+			anime.broadcastDay,
+		);
+		if (insertBefore) {
+			await insertColumnsAt(sheets, sheet.properties.sheetId, targetCol);
+		} else if (siguenStartCol !== null && targetCol >= siguenStartCol) {
+			// Appendeando al final del subgrupo secuela, pero eso pisaría el inicio de "siguen": lo corremos.
+			await insertColumnsAt(sheets, sheet.properties.sheetId, siguenStartCol);
 		}
 		await ensureColumnCapacity(sheets, sheet, targetCol);
 		await writeAnimeBlock(sheets, sheet.properties.sheetId, seasonName, anime, targetCol, layout.imageRow, layout.titleRow, layout.dayRowIndex);
 		await applyContinuacionOuterBorder(sheets, sheet.properties.sheetId, seasonName, layout);
+		invalidateColumnCache(seasonName);
 		return { animeIndex: targetCol, userStart: layout.userStart };
 	}
 
@@ -438,10 +538,19 @@ async function ensureAnimeColumn(seasonName, anime) {
 	const existingIndex = siguenMalIds.indexOf(anime.malId);
 	if (existingIndex !== -1) return { animeIndex: startCol + existingIndex * 2, userStart: layout.userStart };
 
-	const targetCol = startCol + siguenMalIds.length * 2;
+	const { col: targetCol, insertBefore } = await findSortedInsertionColumn(
+		sheets,
+		seasonName,
+		layout.dayRowIndex,
+		startCol,
+		siguenMalIds.length,
+		anime.broadcastDay,
+	);
+	if (insertBefore) await insertColumnsAt(sheets, sheet.properties.sheetId, targetCol);
 	await ensureColumnCapacity(sheets, sheet, targetCol);
 	await writeAnimeBlock(sheets, sheet.properties.sheetId, seasonName, anime, targetCol, layout.imageRow, layout.titleRow, layout.dayRowIndex);
 	await applyContinuacionOuterBorder(sheets, sheet.properties.sheetId, seasonName, layout);
+	invalidateColumnCache(seasonName);
 	return { animeIndex: targetCol, userStart: layout.userStart };
 }
 
@@ -533,6 +642,90 @@ async function setVote(seasonName, username, anime, voteType) {
 	});
 }
 
+// Ubica la columna de voto de un anime sin crear nada (a diferencia de ensureAnimeColumn), usando
+// la caché en memoria cuando ya se resolvió antes para esta temporada.
+async function findAnimeColumn(sheets, seasonName, anime) {
+	const cacheKey = `${seasonName}::${anime.malId}`;
+	if (animeColumnCache.has(cacheKey)) return animeColumnCache.get(cacheKey);
+
+	const result = await locateAnimeColumn(sheets, seasonName, anime);
+	if (result) animeColumnCache.set(cacheKey, result);
+	return result;
+}
+
+// Busca por malId en los tres bloques reales (nuevo, secuela, CONTINUAN) en vez de confiar en
+// anime.isSequel / anime.isCarryover: esas banderas son una heurística de título que puede no
+// coincidir con dónde quedó realmente la columna (ensureAnimeColumn usa una comprobación más
+// precisa al escribir). Devuelve null si el anime no tiene columna en ningún bloque.
+async function locateAnimeColumn(sheets, seasonName, anime) {
+	const nuevoMalIds = await getMalIdsInRange(sheets, seasonName, NUEVO_TITLE_ROW, FIRST_ANIME_COL_INDEX);
+	const nuevoIndex = nuevoMalIds.indexOf(anime.malId);
+	if (nuevoIndex !== -1) return { col: FIRST_ANIME_COL_INDEX + nuevoIndex * 2, userStart: NUEVO_USER_START };
+
+	const layout = await peekContinuacionLayout(sheets, seasonName);
+	if (!layout.exists) return null;
+
+	// Una sola lectura de la fila de títulos sirve para los dos subgrupos (secuela + CONTINUAN);
+	// se corta en JS según dónde empiece "CONTINUAN", en vez de pedirle a la API la misma fila dos veces.
+	const [siguenStartCol, continuacionMalIds] = await Promise.all([
+		findColumnWithLabel(sheets, seasonName, layout.labelRow, SIGUEN_LABEL),
+		getMalIdsInRange(sheets, seasonName, layout.titleRow, FIRST_ANIME_COL_INDEX),
+	]);
+	const splitIndex = siguenStartCol === null ? continuacionMalIds.length : (siguenStartCol - FIRST_ANIME_COL_INDEX) / 2;
+
+	const secuelaIndex = continuacionMalIds.slice(0, splitIndex).indexOf(anime.malId);
+	if (secuelaIndex !== -1) return { col: FIRST_ANIME_COL_INDEX + secuelaIndex * 2, userStart: layout.userStart };
+
+	if (siguenStartCol === null) return null;
+	const siguenIndex = continuacionMalIds.slice(splitIndex).indexOf(anime.malId);
+	return siguenIndex === -1 ? null : { col: siguenStartCol + siguenIndex * 2, userStart: layout.userStart };
+}
+
+// Borra el voto de un usuario para un anime (valor + color de fondo de la celda), sin tocar la
+// columna ni la fila si ya existían. Si el anime o el usuario no tienen celda todavía (p. ej. el
+// voto era "rojo", que nunca se escribe), no hace nada y devuelve false.
+async function clearVote(seasonName, username, anime) {
+	const sheets = await getSheetsClient();
+
+	const [sheet, animeLoc] = await Promise.all([findSheetByTitle(sheets, seasonName), findAnimeColumn(sheets, seasonName, anime)]);
+	if (!sheet || !animeLoc) return false;
+
+	const { userNames } = await getUsersAndDayRow(sheets, seasonName, animeLoc.userStart);
+	const userIndex = userNames.indexOf(username);
+	if (userIndex === -1) return false;
+	const rowIndex = animeLoc.userStart + userIndex;
+
+	await sheets.spreadsheets.values.update({
+		spreadsheetId: SPREADSHEET_ID,
+		range: `'${seasonName}'!${columnLetter(animeLoc.col)}${rowIndex}`,
+		valueInputOption: 'RAW',
+		requestBody: { values: [['']] },
+	});
+
+	await sheets.spreadsheets.batchUpdate({
+		spreadsheetId: SPREADSHEET_ID,
+		requestBody: {
+			requests: [
+				{
+					repeatCell: {
+						range: {
+							sheetId: sheet.properties.sheetId,
+							startRowIndex: rowIndex - 1,
+							endRowIndex: rowIndex,
+							startColumnIndex: animeLoc.col,
+							endColumnIndex: animeLoc.col + 1,
+						},
+						cell: { userEnteredFormat: {} },
+						fields: 'userEnteredFormat.backgroundColor',
+					},
+				},
+			],
+		},
+	});
+
+	return true;
+}
+
 // Recoge los malId de todos los animes (nuevo + continuación, ambos subgrupos) de la pestaña
 // inmediatamente anterior a `seasonName` (la que estaba en el índice 0 antes de crear ésta).
 async function getPreviousTabMalIds(seasonName) {
@@ -555,9 +748,10 @@ async function getPreviousTabMalIds(seasonName) {
 			: [];
 
 		return [...new Set([...nuevoMalIds, ...continuacionMalIds].filter(Boolean))];
-	} catch {
+	} catch (err) {
+		console.error(`getPreviousTabMalIds: no pude leer "${previousTitle}", no hay carryover que detectar:`, err.message);
 		return [];
 	}
 }
 
-module.exports = { ensureSeasonTab, ensureAnimeColumn, ensureUserRow, setVote, getPreviousTabMalIds };
+module.exports = { ensureSeasonTab, ensureAnimeColumn, ensureUserRow, setVote, clearVote, getPreviousTabMalIds };

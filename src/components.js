@@ -1,11 +1,13 @@
 const { ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder } = require('discord.js');
 const { slugForCustomId } = require('./seasonLabel');
 
-function buildAnimeEmbed(anime, { index, total } = {}) {
+const VOTE_STATE_COLOR = { verde: 0x57f287, naranja: 0xe67e22 };
+
+function buildAnimeEmbed(anime, { index, total, voteState } = {}) {
 	const embed = new EmbedBuilder()
 		.setTitle(anime.title)
 		.setURL(anime.url)
-		.setColor(0x2f3136);
+		.setColor(VOTE_STATE_COLOR[voteState] ?? 0x2f3136);
 
 	if (anime.imageUrl) embed.setImage(anime.imageUrl);
 	if (anime.synopsis) {
@@ -24,7 +26,9 @@ function buildAnimeEmbed(anime, { index, total } = {}) {
 	return embed;
 }
 
-function buildVoteRow(seasonLabel, malId, { index, total } = {}) {
+// includeNav=false se usa para los hilos de foro: cada anime ya tiene su propio post, así que no
+// hace falta Anterior/Siguiente/Lista completada, solo el botón de deshacer voto si corresponde.
+function buildVoteRow(seasonLabel, malId, { index, total, voteState, includeNav = true } = {}) {
 	const seasonSlug = slugForCustomId(seasonLabel);
 	const voteRow = new ActionRowBuilder().addComponents(
 		new ButtonBuilder()
@@ -45,21 +49,31 @@ function buildVoteRow(seasonLabel, malId, { index, total } = {}) {
 			.setStyle(ButtonStyle.Secondary),
 	);
 
-	const navRow = new ActionRowBuilder().addComponents(
-		new ButtonBuilder()
-			.setCustomId(`nav:prev:${seasonSlug}:${malId}`)
-			.setLabel('⬅️ Anterior')
-			.setStyle(ButtonStyle.Secondary)
-			.setDisabled(index === 0),
-		new ButtonBuilder()
-			.setCustomId(`nav:next:${seasonSlug}:${malId}`)
-			.setLabel('Siguiente ➡️')
-			.setStyle(ButtonStyle.Secondary)
-			.setDisabled(index === total - 1),
-		new ButtonBuilder().setCustomId(`finish:${seasonSlug}`).setLabel('✅ Lista completada').setStyle(ButtonStyle.Success),
-	);
+	const secondRow = new ActionRowBuilder();
 
-	return [voteRow, navRow];
+	if (includeNav) {
+		secondRow.addComponents(
+			new ButtonBuilder()
+				.setCustomId(`nav:prev:${seasonSlug}:${malId}`)
+				.setLabel('⬅️ Anterior')
+				.setStyle(ButtonStyle.Secondary)
+				.setDisabled(index === 0),
+			new ButtonBuilder()
+				.setCustomId(`nav:next:${seasonSlug}:${malId}`)
+				.setLabel('Siguiente ➡️')
+				.setStyle(ButtonStyle.Secondary)
+				.setDisabled(index === total - 1),
+			new ButtonBuilder().setCustomId(`finish:${seasonSlug}`).setLabel('✅ Lista completada').setStyle(ButtonStyle.Success),
+		);
+	}
+
+	if (voteState) {
+		secondRow.addComponents(
+			new ButtonBuilder().setCustomId(`undovote:${seasonSlug}:${malId}`).setLabel('↩️ Deshacer mi voto').setStyle(ButtonStyle.Secondary),
+		);
+	}
+
+	return secondRow.components.length > 0 ? [voteRow, secondRow] : [voteRow];
 }
 
 module.exports = { buildAnimeEmbed, buildVoteRow };

@@ -1,9 +1,10 @@
 const { ActionRowBuilder, StringSelectMenuBuilder } = require('discord.js');
 const { getTrailers, hasPrequel } = require('./services/jikan');
-const { setVote } = require('./services/sheets');
-const { getAnime, getSeasonLabel, getSeasonOrder } = require('./seasonCache');
+const { setVote, clearVote } = require('./services/sheets');
+const { recordVote, removeVote, getVoteState } = require('./services/db');
+const { getAnime, rememberAnime, getSeasonLabel, getSeasonOrder } = require('./seasonCache');
 const { buildAnimeEmbed, buildVoteRow } = require('./components');
-const { handleSeasonSelect, handleSeasonConfirm } = require('./commands/temporada');
+const { handleSeasonSelect, handleSeasonConfirm } = require('./commands/temporadaShared');
 
 const VOTE_ROLE_ID = process.env.VOTE_ROLE_ID;
 
@@ -36,10 +37,53 @@ async function handleVoteButton(interaction, voteType, seasonSlug, malId) {
 	const username = interaction.member.displayName;
 	const animeForSheet =
 		voteType === 'rojo' ? anime : { ...anime, isSequel: anime.isSequel || (await hasPrequel(anime.malId)) };
+	if (voteType !== 'rojo') rememberAnime(animeForSheet);
 	await setVote(seasonLabel, username, animeForSheet, voteType);
+
+	if (voteType === 'rojo') {
+		removeVote({ seasonLabel, malId: anime.malId, discordId: interaction.member.id });
+	} else {
+		recordVote({ seasonLabel, malId: anime.malId, discordId: interaction.member.id, displayName: username, voteType });
+	}
 
 	const confirmation = voteType === 'rojo' ? `Anotado: no verás **${anime.title}**.` : `Tu voto para **${anime.title}** se guardó.`;
 	await interaction.editReply(confirmation);
+
+	setTimeout(() => {
+		interaction.deleteReply().catch(() => {});
+	}, 1_000);
+}
+
+async function handleUndoVoteButton(interaction, seasonSlug, malId) {
+	if (VOTE_ROLE_ID && !interaction.member.roles.cache.has(VOTE_ROLE_ID)) {
+		await interaction.reply({ content: 'No tienes el rol necesario para votar.', ephemeral: true });
+		return;
+	}
+
+	const anime = getAnime(Number(malId));
+	const seasonLabel = getSeasonLabel(seasonSlug);
+	if (!anime || !seasonLabel) {
+		await interaction.reply({
+			content: 'No encuentro esto en memoria (¿se reinició el bot?). Vuelve a correr /temporada.',
+			ephemeral: true,
+		});
+		return;
+	}
+
+	await interaction.deferReply({ ephemeral: true });
+
+	const username = interaction.member.displayName;
+	const cleared = await clearVote(seasonLabel, username, anime);
+	removeVote({ seasonLabel, malId: anime.malId, discordId: interaction.member.id });
+
+	const confirmation = cleared
+		? `Borré tu voto para **${anime.title}**.`
+		: `No tenías un voto guardado para **${anime.title}**.`;
+	await interaction.editReply(confirmation);
+
+	setTimeout(() => {
+		interaction.deleteReply().catch(() => {});
+	}, 1_000);
 }
 
 async function handleNavButton(interaction, direction, seasonSlug, malId) {
@@ -64,9 +108,11 @@ async function handleNavButton(interaction, direction, seasonSlug, malId) {
 		return;
 	}
 
-	await interaction.update({
-		embeds: [buildAnimeEmbed(newAnime, { index: newIndex, total: order.length })],
-		components: buildVoteRow(seasonLabel, newAnime.malId, { index: newIndex, total: order.length }),
+	await interaction.deferUpdate();
+	const voteState = getVoteState({ seasonLabel, malId: newAnime.malId });
+	await interaction.editReply({
+		embeds: [buildAnimeEmbed(newAnime, { index: newIndex, total: order.length, voteState })],
+		components: buildVoteRow(seasonLabel, newAnime.malId, { index: newIndex, total: order.length, voteState }),
 	});
 }
 
@@ -145,6 +191,9 @@ async function handleInteraction(interaction) {
 		} else if (kind === 'nav') {
 			const [direction, seasonSlug, malId] = rest;
 			await handleNavButton(interaction, direction, seasonSlug, malId);
+		} else if (kind === 'undovote') {
+			const [seasonSlug, malId] = rest;
+			await handleUndoVoteButton(interaction, seasonSlug, malId);
 		} else if (kind === 'seasonconfirm') {
 			const [year, season] = rest;
 			await handleSeasonConfirm(interaction, year, season);
