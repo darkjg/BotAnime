@@ -100,6 +100,7 @@ async function getAnimeById(malId) {
 		broadcastDay: DAY_TO_ES[entry.broadcast?.day] ?? entry.broadcast?.day ?? null,
 		url: entry.url,
 		status: entry.status,
+		airedTo: entry.aired?.to ?? null,
 		isSequel: isSequel(entry.title) || isSequel(entry.title_english ?? ''),
 	};
 }

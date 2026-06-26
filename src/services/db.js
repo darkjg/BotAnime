@@ -34,6 +34,12 @@ db.exec(`
 		notified_date TEXT NOT NULL,
 		PRIMARY KEY (season_label, mal_id, notified_date)
 	);
+
+	CREATE TABLE IF NOT EXISTS forum_channels (
+		guild_id TEXT PRIMARY KEY,
+		channel_id TEXT NOT NULL,
+		season_label TEXT NOT NULL
+	);
 `);
 
 // Recuerda un anime publicado (título, día de emisión, a qué server/temporada pertenece) para que
@@ -105,6 +111,17 @@ function markNotifiedToday({ seasonLabel, malId, dateKey }) {
 	db.prepare(`INSERT OR IGNORE INTO notified_episodes (season_label, mal_id, notified_date) VALUES (?, ?, ?)`).run(seasonLabel, malId, dateKey);
 }
 
+function getForumChannel(guildId) {
+	return db.prepare(`SELECT channel_id AS channelId, season_label AS seasonLabel FROM forum_channels WHERE guild_id = ?`).get(guildId) ?? null;
+}
+
+function setForumChannel({ guildId, channelId, seasonLabel }) {
+	db.prepare(
+		`INSERT INTO forum_channels (guild_id, channel_id, season_label) VALUES (?, ?, ?)
+		 ON CONFLICT(guild_id) DO UPDATE SET channel_id = excluded.channel_id, season_label = excluded.season_label`,
+	).run(guildId, channelId, seasonLabel);
+}
+
 module.exports = {
 	upsertAnime,
 	recordVote,
@@ -116,4 +133,6 @@ module.exports = {
 	getAnimeAiringOn,
 	wasNotifiedToday,
 	markNotifiedToday,
+	getForumChannel,
+	setForumChannel,
 };

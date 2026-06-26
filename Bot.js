@@ -1,4 +1,5 @@
 require('dotenv').config();
+require('./src/logging');
 const { Client, GatewayIntentBits, Collection } = require('discord.js');
 const temporada = require('./src/commands/temporada');
 const temporadaForo = require('./src/commands/temporadaForo');
@@ -21,6 +22,7 @@ client.once('clientReady', () => {
 client.on('interactionCreate', async (interaction) => {
 	try {
 		if (interaction.isChatInputCommand()) {
+			console.log(`[bot] /${interaction.commandName} usado por ${interaction.user.tag} en guild ${interaction.guildId}`);
 			const command = client.commands.get(interaction.commandName);
 			if (!command) return;
 			await command.execute(interaction);
@@ -29,7 +31,7 @@ client.on('interactionCreate', async (interaction) => {
 
 		await handleInteraction(interaction);
 	} catch (error) {
-		console.error(error);
+		console.error('[bot] error procesando interacción:', error);
 		const errorMessage = 'Ocurrió un error al procesar la interacción.';
 		if (interaction.deferred || interaction.replied) {
 			await interaction.editReply(errorMessage).catch(() => {});

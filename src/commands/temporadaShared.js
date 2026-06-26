@@ -1,56 +1,43 @@
 const { SlashCommandBuilder, StringSelectMenuBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType, ForumLayoutType } = require('discord.js');
 const { getSeasonAnime, getAnimeById } = require('../services/jikan');
 const { ensureSeasonTab, ensureAnimeColumn, getPreviousTabMalIds } = require('../services/sheets');
-const { upsertAnime, getVoteState } = require('../services/db');
-const { defaultSeasonLabel, slugForCustomId, ES_SEASON_TO_JIKAN, JIKAN_SEASON_TO_ES, nextSeason, seasonAtOffset } = require('../seasonLabel');
+const { upsertAnime, getVoteState, getForumChannel, setForumChannel } = require('../services/db');
+const { defaultSeasonLabel, slugForCustomId, JIKAN_SEASON_TO_ES, seasonAtOffset } = require('../seasonLabel');
 const { rememberAnime, rememberSeasonLabel, rememberSeasonOrder } = require('../seasonCache');
 const { buildAnimeEmbed, buildVoteRow } = require('../components');
 
 const VOTE_ROLE_ID = process.env.VOTE_ROLE_ID;
-const MAX_MENTIONED_VOTERS = 10;
 const SEASON_PICKER_RANGE = { from: -2, to: 4 }; // temporadas relativas a la actual que se muestran en el selector
 const FORUM_TAG_NAMES = ['Nuevo', 'Secuela', 'CONTINUAN'];
-const FORUM_THREAD_DELAY_MS = 400; // pequeña pausa entre hilos para no pegar contra el rate limit al crear ~70 de golpe
+// Con concurrencia 4 y sin pausa, crear ~36 hilos disparó un rate limit "grande" de Discord que
+// discord.js esperó en silencio durante más de 3 minutos (sin tirar error, simplemente se frenó
+// todo). Bajamos la concurrencia y agregamos un margen entre tandas para no volver a pegarle a eso.
+const FORUM_THREAD_CONCURRENCY = 2;
+const FORUM_BATCH_DELAY_MS = 350;
 
 function sleep(ms) {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function chunk(array, size) {
+	const chunks = [];
+	for (let i = 0; i < array.length; i += size) chunks.push(array.slice(i, i + size));
+	return chunks;
+}
+
 // Define las opciones comunes a /temporada y /temporada-foro; cada comando le pone su propio
-// nombre/descripción.
+// nombre/descripción. La temporada siempre se elige con el selector; el único parámetro manual es
+// el nombre de la pestaña de la sheet, por si hay que pisar el que se calcula automáticamente.
 function buildTemporadaCommandData(name, description) {
-	const data = new SlashCommandBuilder()
+	return new SlashCommandBuilder()
 		.setName(name)
 		.setDescription(description)
-		.addStringOption((option) =>
-			option
-				.setName('estacion')
-				.setDescription('Estación a publicar. Si se omite junto con "anio", se abre un selector.')
-				.setRequired(false)
-				.addChoices(
-					{ name: 'Invierno', value: 'invierno' },
-					{ name: 'Primavera', value: 'primavera' },
-					{ name: 'Verano', value: 'verano' },
-					{ name: 'Otoño', value: 'otono' },
-				),
-		)
-		.addIntegerOption((option) =>
-			option.setName('anio').setDescription('Año de la temporada, ej: 2026. Si se omite, se usa el año actual.').setRequired(false),
-		)
 		.addStringOption((option) =>
 			option
 				.setName('nombre')
 				.setDescription('Nombre de la pestaña de la sheet, ej: "Verano 2026". Si se omite, se calcula automáticamente.')
 				.setRequired(false),
 		);
-
-	for (let i = 1; i <= MAX_MENTIONED_VOTERS; i += 1) {
-		data.addUserOption((option) =>
-			option.setName(`usuario${i}`).setDescription('Persona que va a votar en esta temporada').setRequired(false),
-		);
-	}
-
-	return data;
 }
 
 async function getVoterNames(interaction) {
@@ -60,12 +47,6 @@ async function getVoterNames(interaction) {
 		await interaction.guild.members.fetch();
 		const role = interaction.guild.roles.cache.get(VOTE_ROLE_ID);
 		role?.members.forEach((member) => byId.set(member.id, member.displayName));
-	}
-
-	for (let i = 1; i <= MAX_MENTIONED_VOTERS; i += 1) {
-		const member = interaction.options.getMember(`usuario${i}`);
-		const user = interaction.options.getUser(`usuario${i}`);
-		if (user) byId.set(user.id, member?.displayName ?? user.username);
 	}
 
 	return [...byId.values()];
@@ -92,36 +73,18 @@ function buildConfirmRow(year, season) {
 	);
 }
 
-// Punto de entrada compartido por /temporada y /temporada-foro: resuelve año/estación (o muestra el
-// selector si no se especificó ninguno) y al final llama a `publish` con el destino ya resuelto.
+// Punto de entrada compartido por /temporada y /temporada-foro: siempre muestra el selector de
+// temporada y al confirmar llama a `publish` con el destino ya resuelto.
 async function runTemporadaCommand(interaction, mode) {
 	await interaction.deferReply();
 
-	const estacionOpt = interaction.options.getString('estacion');
-	const anioOpt = interaction.options.getInteger('anio');
 	const nombreOverride = interaction.options.getString('nombre');
 	const voterNames = await getVoterNames(interaction);
 
-	if (!estacionOpt && !anioOpt) {
-		await interaction.editReply({ content: '¿Qué temporada quieres publicar?', components: [buildSeasonSelectRow()] });
-		const message = await interaction.fetchReply();
-		interaction.client.seasonPickerCache = interaction.client.seasonPickerCache ?? new Map();
-		interaction.client.seasonPickerCache.set(message.id, { nombreOverride, voterNames, mode });
-		return;
-	}
-
-	const fallback = nextSeason();
-	const season = estacionOpt ? ES_SEASON_TO_JIKAN[estacionOpt] : fallback.season;
-	const year = anioOpt ?? (estacionOpt ? new Date().getFullYear() : fallback.year);
-
-	await publish(mode, {
-		interaction,
-		respond: (content) => interaction.editReply(content),
-		year,
-		season,
-		nombreOverride,
-		voterNames,
-	});
+	await interaction.editReply({ content: '¿Qué temporada quieres publicar?', components: [buildSeasonSelectRow()] });
+	const message = await interaction.fetchReply();
+	interaction.client.seasonPickerCache = interaction.client.seasonPickerCache ?? new Map();
+	interaction.client.seasonPickerCache.set(message.id, { nombreOverride, voterNames, mode });
 }
 
 // Llamada desde interactions.js tras elegir una opción del selector: muestra un botón de
@@ -158,7 +121,9 @@ function publish(mode, args) {
 // Resuelve la lista de animes de la temporada, prepara la pestaña de la sheet y devuelve todo lo
 // necesario para publicarla, sin tocar todavía el canal/foro de destino (eso lo hace cada modo).
 async function prepareSeason({ guildId, year, season, nombreOverride }) {
+	console.log(`[temporada] resolviendo ${season} ${year} (guild ${guildId})...`);
 	const anime = await getSeasonAnime(year, season);
+	console.log(`[temporada] Jikan devolvió ${anime.length} animes para ${season} ${year}`);
 	if (anime.length === 0) return null;
 
 	const seasonLabel = nombreOverride ?? defaultSeasonLabel(anime[0]);
@@ -173,29 +138,44 @@ async function prepareSeason({ guildId, year, season, nombreOverride }) {
 	}
 
 	const carryoverCount = await addCarryoverAnime(seasonLabel, anime, guildId);
+	console.log(`[temporada] "${seasonLabel}" lista: ${anime.length} animes + ${carryoverCount} carryover`);
 
 	return { seasonLabel, anime, carryoverCount };
 }
 
+// El campo `status` de Jikan/MAL puede quedar en "Currently Airing" un tiempo después de que el
+// último episodio ya salió al aire (no se actualiza al instante); por eso además del status hay que
+// chequear que la fecha de fin (aired.to) no haya pasado todavía.
+function isActuallyAiring(anime) {
+	if (anime.status !== 'Currently Airing') return false;
+	if (!anime.airedTo) return true;
+	return new Date(anime.airedTo) >= new Date();
+}
+
 // Animes que ya estaban en la pestaña anterior (en cualquiera de sus bloques) y que en MAL siguen
-// "Currently Airing" se agregan directo al subgrupo CONTINUAN, sin esperar a que alguien vote.
+// emitiéndose se agregan directo al subgrupo CONTINUAN, sin esperar a que alguien vote.
 // El orden por día de emisión dentro de la sheet lo decide ensureAnimeColumn al insertar.
 async function addCarryoverAnime(seasonLabel, currentSeasonAnime, guildId) {
 	const currentMalIds = new Set(currentSeasonAnime.map((a) => a.malId));
 	const previousMalIds = await getPreviousTabMalIds(seasonLabel);
 
+	console.log(`[temporada] revisando ${previousMalIds.length} animes de la temporada anterior para carryover...`);
 	let count = 0;
 	for (const malId of previousMalIds) {
 		if (currentMalIds.has(malId)) continue;
 		try {
 			const fullAnime = await getAnimeById(malId);
-			if (fullAnime.status !== 'Currently Airing') continue;
+			if (!isActuallyAiring(fullAnime)) {
+				console.log(`[temporada] "${fullAnime.title}" ya terminó (status: ${fullAnime.status}, fin: ${fullAnime.airedTo ?? 'desconocido'}), no va a CONTINUAN`);
+				continue;
+			}
 			rememberAnime(fullAnime);
 			await ensureAnimeColumn(seasonLabel, { ...fullAnime, isCarryover: true });
 			upsertAnime({ malId: fullAnime.malId, seasonLabel, guildId, title: fullAnime.title, url: fullAnime.url, broadcastDay: fullAnime.broadcastDay });
+			console.log(`[temporada] carryover: "${fullAnime.title}" sigue en emisión, agregado a CONTINUAN`);
 			count += 1;
-		} catch {
-			// si Jikan falla para este anime en particular, lo saltamos sin romper el comando
+		} catch (err) {
+			console.error(`[temporada] no pude revisar el malId ${malId} para carryover:`, err.message);
 		}
 	}
 	return count;
@@ -245,26 +225,46 @@ function forumChannelSlug(seasonLabel) {
 		.replace(/^-+|-+$/g, '');
 }
 
-// Busca un canal de foro ya creado para esta temporada (mismo nombre, mismo servidor); si no existe,
-// lo crea con las etiquetas que distinguen nuevo/secuela/CONTINUAN y en vista de galería.
+// Busca el canal de foro ya creado para esta temporada (lo recordamos por servidor en la DB local,
+// no por nombre); si el foro guardado es de una temporada DISTINTA, lo borra antes de crear el
+// nuevo, para no dejar canales de temporadas viejas acumulándose. Si no hay ninguno, crea uno con
+// las etiquetas que distinguen nuevo/secuela/CONTINUAN y en vista de galería.
 async function getOrCreateForumChannel(guild, seasonLabel, parentId) {
-	const name = forumChannelSlug(seasonLabel);
-	const existing = guild.channels.cache.find((ch) => ch.type === ChannelType.GuildForum && ch.name === name);
-	if (existing) {
-		if (existing.defaultForumLayout !== ForumLayoutType.GalleryView) {
-			await existing.setDefaultForumLayout(ForumLayoutType.GalleryView).catch(() => {});
+	const stored = getForumChannel(guild.id);
+
+	if (stored && stored.seasonLabel === seasonLabel) {
+		const existing = await guild.channels.fetch(stored.channelId).catch(() => null);
+		if (existing) {
+			console.log(`[temporada-foro] reutilizando canal existente #${existing.name} para "${seasonLabel}"`);
+			if (existing.defaultForumLayout !== ForumLayoutType.GalleryView) {
+				await existing.setDefaultForumLayout(ForumLayoutType.GalleryView).catch(() => {});
+			}
+			return existing;
 		}
-		return existing;
 	}
 
-	return guild.channels.create({
-		name,
+	if (stored && stored.seasonLabel !== seasonLabel) {
+		const old = await guild.channels.fetch(stored.channelId).catch(() => null);
+		if (old) {
+			console.log(`[temporada-foro] borrando canal viejo #${old.name} (temporada "${stored.seasonLabel}") para reemplazarlo por "${seasonLabel}"`);
+			await old.delete(`Reemplazado por el foro de ${seasonLabel}`).catch((err) =>
+				console.error(`[temporada-foro] no pude borrar el canal viejo:`, err.message),
+			);
+		}
+	}
+
+	console.log(`[temporada-foro] creando canal de foro nuevo para "${seasonLabel}"...`);
+	const forumChannel = await guild.channels.create({
+		name: forumChannelSlug(seasonLabel),
 		type: ChannelType.GuildForum,
 		parent: parentId ?? undefined,
 		topic: `Votación de ${seasonLabel}`,
 		defaultForumLayout: ForumLayoutType.GalleryView,
 		availableTags: FORUM_TAG_NAMES.map((tagName) => ({ name: tagName })),
 	});
+
+	setForumChannel({ guildId: guild.id, channelId: forumChannel.id, seasonLabel });
+	return forumChannel;
 }
 
 function tagIdFor(forumChannel, anime) {
@@ -298,25 +298,64 @@ async function publishSeasonForum({ interaction, respond, year, season, nombreOv
 		`Publicando **${anime.length}** animes de **${seasonLabel}** como hilos en ${forumChannel}. Los votos se guardarán en la pestaña "${seasonLabel}" de la sheet.${carryoverNoteText(carryoverCount)}\nVan a votar: ${voterListText(voterNames)}.`,
 	);
 
+	console.log(`[temporada-foro] canal listo: #${forumChannel.name} (${forumChannel.id}). Creando ${anime.length} hilos...`);
+
 	// Discord ordena los posts del foro por actividad más reciente primero: el último hilo creado
 	// queda arriba. Creamos en orden inverso para que el anime más importante (anime[0], el más
-	// popular según Jikan) sea el último en crearse y termine arriba de todo.
-	for (const entry of [...anime].reverse()) {
-		try {
-			const voteState = getVoteState({ seasonLabel, malId: entry.malId });
-			await forumChannel.threads.create({
-				name: entry.title.slice(0, 100),
-				message: {
-					embeds: [buildAnimeEmbed(entry, { voteState })],
-					components: buildVoteRow(seasonLabel, entry.malId, { voteState, includeNav: false }),
-				},
-				appliedTags: [tagIdFor(forumChannel, entry)].filter(Boolean),
-			});
-		} catch (err) {
-			console.error(`No pude crear el hilo para ${entry.title}:`, err.message);
+	// popular según Jikan) sea el último en crearse y termine arriba de todo. Se manda cada tanda en
+	// paralelo (en vez de uno por uno con pausa fija) para que tarde mucho menos; dentro de una misma
+	// tanda el orden de llegada puede variar un poco, pero entre tandas se respeta.
+	let created = 0;
+	const reversed = [...anime].reverse();
+	const batches = chunk(reversed, FORUM_THREAD_CONCURRENCY);
+	let lastProgressUpdateAt = 0;
+
+	for (const [batchIndex, batch] of batches.entries()) {
+		const batchStartedAt = Date.now();
+		const results = await Promise.allSettled(
+			batch.map(async (entry) => {
+				const voteState = getVoteState({ seasonLabel, malId: entry.malId });
+				await forumChannel.threads.create({
+					name: entry.title.slice(0, 100),
+					message: {
+						embeds: [buildAnimeEmbed(entry, { voteState })],
+						components: buildVoteRow(seasonLabel, entry.malId, { voteState, includeNav: false }),
+					},
+					appliedTags: [tagIdFor(forumChannel, entry)].filter(Boolean),
+				});
+				return entry.title;
+			}),
+		);
+
+		for (const result of results) {
+			if (result.status === 'fulfilled') {
+				created += 1;
+			} else {
+				console.error(`[temporada-foro] no pude crear un hilo:`, result.reason?.message ?? result.reason);
+			}
 		}
-		await sleep(FORUM_THREAD_DELAY_MS);
+
+		const batchMs = Date.now() - batchStartedAt;
+		console.log(`[temporada-foro] tanda ${batchIndex + 1}/${batches.length}: ${created}/${reversed.length} hilos creados hasta ahora (${batchMs}ms)`);
+
+		const isLast = batchIndex === batches.length - 1;
+		if (batchMs > 10_000) {
+			console.error(`[temporada-foro] la tanda ${batchIndex + 1} tardó ${Math.round(batchMs / 1000)}s — probablemente Discord aplicó un rate limit largo`);
+			await respond(
+				`Sigo publicando, va lento porque Discord está frenando la creación de hilos (no es que el bot se colgó) — ${created}/${reversed.length} hilos creados hasta ahora.`,
+			).catch(() => {});
+			lastProgressUpdateAt = Date.now();
+		} else if (!isLast && Date.now() - lastProgressUpdateAt > 5_000) {
+			await respond(`Publicando hilos... ${created}/${reversed.length} creados hasta ahora.`).catch(() => {});
+			lastProgressUpdateAt = Date.now();
+		}
+
+		await sleep(FORUM_BATCH_DELAY_MS);
 	}
+
+	await respond(`Listo, los ${created}/${anime.length} hilos de **${seasonLabel}** ya están publicados en ${forumChannel}.`).catch(() => {});
+
+	console.log(`[temporada-foro] listo: ${created}/${anime.length} hilos creados en "${seasonLabel}"`);
 }
 
 module.exports = {
@@ -324,4 +363,5 @@ module.exports = {
 	runTemporadaCommand,
 	handleSeasonSelect,
 	handleSeasonConfirm,
+	publish,
 };

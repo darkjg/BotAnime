@@ -46,6 +46,8 @@ async function handleVoteButton(interaction, voteType, seasonSlug, malId) {
 		recordVote({ seasonLabel, malId: anime.malId, discordId: interaction.member.id, displayName: username, voteType });
 	}
 
+	console.log(`[interactions] voto "${voteType}" de ${username} para "${anime.title}" (${seasonLabel})`);
+
 	const confirmation = voteType === 'rojo' ? `Anotado: no verás **${anime.title}**.` : `Tu voto para **${anime.title}** se guardó.`;
 	await interaction.editReply(confirmation);
 
@@ -75,6 +77,8 @@ async function handleUndoVoteButton(interaction, seasonSlug, malId) {
 	const username = interaction.member.displayName;
 	const cleared = await clearVote(seasonLabel, username, anime);
 	removeVote({ seasonLabel, malId: anime.malId, discordId: interaction.member.id });
+
+	console.log(`[interactions] deshacer voto de ${username} para "${anime.title}" (${seasonLabel}): ${cleared ? 'borrado' : 'no había voto'}`);
 
 	const confirmation = cleared
 		? `Borré tu voto para **${anime.title}**.`
@@ -110,6 +114,7 @@ async function handleNavButton(interaction, direction, seasonSlug, malId) {
 
 	await interaction.deferUpdate();
 	const voteState = getVoteState({ seasonLabel, malId: newAnime.malId });
+	console.log(`[interactions] nav "${direction}" en ${seasonLabel}: ahora muestra "${newAnime.title}" (${newIndex + 1}/${order.length})`);
 	await interaction.editReply({
 		embeds: [buildAnimeEmbed(newAnime, { index: newIndex, total: order.length, voteState })],
 		components: buildVoteRow(seasonLabel, newAnime.malId, { index: newIndex, total: order.length, voteState }),
@@ -123,6 +128,7 @@ async function handleFinishButton(interaction, seasonSlug) {
 	}
 
 	const seasonLabel = getSeasonLabel(seasonSlug) ?? 'esta temporada';
+	console.log(`[interactions] "${seasonLabel}" marcada como completa por ${interaction.member.displayName}`);
 	await interaction.update({
 		content: `Temporada **${seasonLabel}** completa. ¡Gracias por votar!`,
 		embeds: [],
@@ -179,6 +185,8 @@ async function handleTrailerSelect(interaction, malId) {
 
 async function handleInteraction(interaction) {
 	if (interaction.isChatInputCommand()) return;
+
+	console.log(`[interactions] customId="${interaction.customId}" de ${interaction.user.tag}`);
 
 	if (interaction.isButton()) {
 		const [kind, ...rest] = interaction.customId.split(':');
