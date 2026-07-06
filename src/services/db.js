@@ -8,7 +8,17 @@ const path = require('node:path');
 const DB_PATH = path.join(__dirname, '..', '..', 'botanime.json');
 
 function emptyStore() {
-	return { anime: {}, votes: {}, notificationChannels: {}, notifiedEpisodes: {}, forumChannels: {} };
+	return {
+		anime: {},
+		votes: {},
+		notificationChannels: {},
+		notifiedEpisodes: {},
+		av1NotifiedEpisodes: {},
+		forumChannels: {},
+		activeSeasons: {},
+		voteRoles: {},
+		progress: {},
+	};
 }
 
 function loadStore() {
@@ -23,6 +33,15 @@ function loadStore() {
 
 const store = loadStore();
 
+// Migración: antes el rol requerido para votar era un único VOTE_ROLE_ID global en .env, el mismo
+// para todos los guilds. Al hacerlo configurable por servidor (para poder tener un guild de pruebas
+// sin esa restricción), sembramos ese valor una sola vez para el guild de producción (GUILD_ID) así
+// no hace falta correr ningún comando a mano para no perder el comportamiento que ya tenía.
+if (process.env.GUILD_ID && process.env.VOTE_ROLE_ID && !(process.env.GUILD_ID in store.voteRoles)) {
+	store.voteRoles[process.env.GUILD_ID] = process.env.VOTE_ROLE_ID;
+	save();
+}
+
 function save() {
 	fs.writeFileSync(DB_PATH, JSON.stringify(store, null, 1));
 }
@@ -30,12 +49,63 @@ function save() {
 const animeKey = (malId, seasonLabel) => `${seasonLabel}::${malId}`;
 const voteKey = (seasonLabel, malId, discordId) => `${seasonLabel}::${malId}::${discordId}`;
 const notifiedKey = (seasonLabel, malId, dateKey) => `${seasonLabel}::${malId}::${dateKey}`;
+const progressKey = (seasonLabel, malId, discordId) => `${seasonLabel}::${malId}::${discordId}`;
 
 // Recuerda un anime publicado (título, día de emisión, a qué server/temporada pertenece) para que
-// el aviso semanal pueda encontrarlo después de un reinicio, sin depender de la caché en memoria.
-function upsertAnime({ malId, seasonLabel, guildId, title, url, broadcastDay }) {
-	store.anime[animeKey(malId, seasonLabel)] = { malId, seasonLabel, guildId, title, url: url ?? null, broadcastDay: broadcastDay ?? null };
+// el aviso semanal pueda encontrarlo después de un reinicio, sin depender de la caché en memoria, y
+// para poder reconstruir la pestaña de la sheet desde cero (ver rebuildSeasonTab). isSequel/isCarryover
+// no se conocen todavía cuando se publica la temporada (se resuelven recién al votar, o al detectar
+// carryover); por eso esto hace merge campo por campo en vez de pisar el registro entero, así una
+// llamada posterior puede completar isSequel/imageUrl sin perder lo que ya había.
+function upsertAnime({ malId, seasonLabel, guildId, title, url, imageUrl, broadcastDay, isSequel, isCarryover }) {
+	const key = animeKey(malId, seasonLabel);
+	const existing = store.anime[key] ?? {};
+	store.anime[key] = {
+		malId,
+		seasonLabel,
+		guildId,
+		title: title ?? existing.title ?? null,
+		url: url ?? existing.url ?? null,
+		imageUrl: imageUrl ?? existing.imageUrl ?? null,
+		broadcastDay: broadcastDay ?? existing.broadcastDay ?? null,
+		isSequel: isSequel ?? existing.isSequel ?? false,
+		isCarryover: isCarryover ?? existing.isCarryover ?? false,
+	};
 	save();
+}
+
+// Todos los animes recordados de una temporada (para reconstruir su pestaña desde cero).
+function getAnimeForSeason(seasonLabel) {
+	return Object.values(store.anime).filter((a) => a.seasonLabel === seasonLabel);
+}
+
+// Todos los animes recordados de cualquier temporada (para reconstruir seasonCache.js desde cero si
+// hace falta, ver seasonCache.js).
+function getAllAnime() {
+	return Object.values(store.anime);
+}
+
+// Todos los votos de una temporada (para reconstruir su pestaña desde cero).
+function getVotesForSeason(seasonLabel) {
+	return Object.values(store.votes).filter((v) => v.seasonLabel === seasonLabel);
+}
+
+// Recuerda cuál es la temporada "activa" de un guild (la última publicada con /temporada o
+// /temporada-foro), para que la reconstrucción automática sepa qué pestaña tocar sin tener que
+// adivinarlo. Se guarda una por guild porque cada servidor puede estar en una temporada distinta.
+function setActiveSeason({ guildId, seasonLabel }) {
+	store.activeSeasons[guildId] = seasonLabel;
+	save();
+}
+
+function getActiveSeason(guildId) {
+	return store.activeSeasons[guildId] ?? null;
+}
+
+// Lista sin duplicados de las temporadas activas de todos los guilds (varios servidores pueden
+// compartir la misma pestaña/temporada).
+function listActiveSeasonLabels() {
+	return [...new Set(Object.values(store.activeSeasons))];
 }
 
 // "Verde"/"naranja" cuentan como que la persona sigue el anime; "rojo" se maneja con removeVote.
@@ -55,12 +125,51 @@ function getWatchers({ seasonLabel, malId }) {
 		.map((v) => v.discordId);
 }
 
+// malId de los animes que esta persona votó verde/naranja en la temporada (para el autocompletado de
+// /capitulo: no tiene sentido ofrecer animes que no está siguiendo).
+function getUserVotedAnime({ seasonLabel, discordId }) {
+	return Object.values(store.votes)
+		.filter((v) => v.seasonLabel === seasonLabel && v.discordId === discordId && (v.voteType === 'verde' || v.voteType === 'naranja'))
+		.map((v) => v.malId);
+}
+
 // 'verde' si alguien ya dijo que lo va a ver, si no 'naranja' si alguien lo está pensando, si no null.
 function getVoteState({ seasonLabel, malId }) {
 	const relevant = Object.values(store.votes).filter((v) => v.seasonLabel === seasonLabel && v.malId === malId);
 	if (relevant.some((v) => v.voteType === 'verde')) return 'verde';
 	if (relevant.some((v) => v.voteType === 'naranja')) return 'naranja';
 	return null;
+}
+
+// El progreso (capítulo por el que va cada persona) se guarda separado de los votos a propósito:
+// tiene que poder marcarse aunque el voto sea rojo o todavía no exista, y los botones +/- de capítulo
+// no dependen de haber votado.
+function addEpisodesWatched({ seasonLabel, malId, discordId, displayName, delta }) {
+	const key = progressKey(seasonLabel, malId, discordId);
+	const current = store.progress[key]?.episodesWatched ?? 0;
+	const episodesWatched = Math.max(0, current + delta);
+	store.progress[key] = { seasonLabel, malId, discordId, displayName, episodesWatched };
+	save();
+	return episodesWatched;
+}
+
+// Solo devuelve a quienes tienen progreso > 0, para no mostrar en el embed a todo el mundo en "cap. 0".
+function getProgressForAnime({ seasonLabel, malId }) {
+	return Object.values(store.progress).filter((p) => p.seasonLabel === seasonLabel && p.malId === malId && p.episodesWatched > 0);
+}
+
+function getEpisodesWatched({ seasonLabel, malId, discordId }) {
+	return store.progress[progressKey(seasonLabel, malId, discordId)]?.episodesWatched ?? 0;
+}
+
+// A diferencia de addEpisodesWatched (delta +/-, para el flujo de botón+modal), esto fija el número
+// absoluto: lo usa /capitulo, donde el autocompletado ya sugiere el capítulo actual y la persona
+// escribe directamente "por cuál va", no cuánto sumar.
+function setEpisodesWatched({ seasonLabel, malId, discordId, displayName, episodesWatched }) {
+	const key = progressKey(seasonLabel, malId, discordId);
+	store.progress[key] = { seasonLabel, malId, discordId, displayName, episodesWatched: Math.max(0, episodesWatched) };
+	save();
+	return store.progress[key].episodesWatched;
 }
 
 function setNotificationChannel({ guildId, channelId }) {
@@ -85,6 +194,27 @@ function markNotifiedToday({ seasonLabel, malId, dateKey }) {
 	save();
 }
 
+// Último episodio de animeav1 ya avisado para este anime, para no repetir el aviso en cada chequeo.
+function getLastNotifiedAv1Episode({ seasonLabel, malId }) {
+	return store.av1NotifiedEpisodes[animeKey(malId, seasonLabel)] ?? 0;
+}
+
+function setLastNotifiedAv1Episode({ seasonLabel, malId, episode }) {
+	store.av1NotifiedEpisodes[animeKey(malId, seasonLabel)] = episode;
+	save();
+}
+
+// Rol requerido para votar en un guild; si no hay ninguno configurado, cualquiera puede votar ahí
+// (así el guild de pruebas puede no tener restricción sin afectar producción).
+function getVoteRole(guildId) {
+	return store.voteRoles[guildId] ?? null;
+}
+
+function setVoteRole({ guildId, roleId }) {
+	store.voteRoles[guildId] = roleId;
+	save();
+}
+
 function getForumChannel(guildId) {
 	return store.forumChannels[guildId] ?? null;
 }
@@ -100,11 +230,26 @@ module.exports = {
 	removeVote,
 	getWatchers,
 	getVoteState,
+	getUserVotedAnime,
+	addEpisodesWatched,
+	setEpisodesWatched,
+	getEpisodesWatched,
+	getProgressForAnime,
 	setNotificationChannel,
 	getNotificationChannel,
 	getAnimeAiringOn,
 	wasNotifiedToday,
 	markNotifiedToday,
+	getLastNotifiedAv1Episode,
+	setLastNotifiedAv1Episode,
+	getVoteRole,
+	setVoteRole,
 	getForumChannel,
 	setForumChannel,
+	getAnimeForSeason,
+	getAllAnime,
+	getVotesForSeason,
+	setActiveSeason,
+	getActiveSeason,
+	listActiveSeasonLabels,
 };

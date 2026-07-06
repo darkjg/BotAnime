@@ -3,7 +3,7 @@ const { slugForCustomId } = require('./seasonLabel');
 
 const VOTE_STATE_COLOR = { verde: 0x57f287, naranja: 0xe67e22 };
 
-function buildAnimeEmbed(anime, { index, total, voteState } = {}) {
+function buildAnimeEmbed(anime, { voteState, progress } = {}) {
 	const embed = new EmbedBuilder()
 		.setTitle(anime.title)
 		.setURL(anime.url)
@@ -21,14 +21,27 @@ function buildAnimeEmbed(anime, { index, total, voteState } = {}) {
 		{ name: 'Estudio', value: anime.studios || 'Desconocido', inline: true },
 	);
 
-	if (Number.isInteger(index) && Number.isInteger(total)) embed.setFooter({ text: `${index + 1}/${total}` });
+	if (progress?.length > 0) {
+		const lines = [...progress]
+			.sort((a, b) => b.episodesWatched - a.episodesWatched)
+			.map((p) => `**${p.displayName}**: cap. ${p.episodesWatched}`)
+			.join('\n');
+		embed.addFields({ name: '📺 Progreso', value: lines });
+	}
 
 	return embed;
 }
 
-// includeNav=false se usa para los hilos de foro: cada anime ya tiene su propio post, así que no
-// hace falta Anterior/Siguiente/Lista completada, solo el botón de deshacer voto si corresponde.
-function buildVoteRow(seasonLabel, malId, { index, total, voteState, includeNav = true } = {}) {
+// Se usa tanto en el hilo de voto como en el aviso de "nuevo episodio disponible" del scheduler, así
+// que vive aparte de buildVoteRow.
+function buildEpisodeButtonRow(seasonLabel, malId) {
+	const seasonSlug = slugForCustomId(seasonLabel);
+	return new ActionRowBuilder().addComponents(
+		new ButtonBuilder().setCustomId(`episodepick:${seasonSlug}:${malId}`).setLabel('📺 Actualizar capítulo').setStyle(ButtonStyle.Secondary),
+	);
+}
+
+function buildVoteRow(seasonLabel, malId, { voteState } = {}) {
 	const seasonSlug = slugForCustomId(seasonLabel);
 	const voteRow = new ActionRowBuilder().addComponents(
 		new ButtonBuilder()
@@ -49,31 +62,17 @@ function buildVoteRow(seasonLabel, malId, { index, total, voteState, includeNav 
 			.setStyle(ButtonStyle.Secondary),
 	);
 
-	const secondRow = new ActionRowBuilder();
+	// Siempre visible, no depende del voto (se puede llevar la cuenta de capítulos aunque el voto sea
+	// rojo o todavía no se haya votado). Abre un selector de usuarios en vez de actuar solo sobre quien
+	// aprieta el botón, porque una misma persona suele actualizar el capítulo de todo el grupo a la vez.
+	const episodeRow = buildEpisodeButtonRow(seasonLabel, malId);
 
-	if (includeNav) {
-		secondRow.addComponents(
-			new ButtonBuilder()
-				.setCustomId(`nav:prev:${seasonSlug}:${malId}`)
-				.setLabel('⬅️ Anterior')
-				.setStyle(ButtonStyle.Secondary)
-				.setDisabled(index === 0),
-			new ButtonBuilder()
-				.setCustomId(`nav:next:${seasonSlug}:${malId}`)
-				.setLabel('Siguiente ➡️')
-				.setStyle(ButtonStyle.Secondary)
-				.setDisabled(index === total - 1),
-			new ButtonBuilder().setCustomId(`finish:${seasonSlug}`).setLabel('✅ Lista completada').setStyle(ButtonStyle.Success),
-		);
-	}
+	if (!voteState) return [voteRow, episodeRow];
 
-	if (voteState) {
-		secondRow.addComponents(
-			new ButtonBuilder().setCustomId(`undovote:${seasonSlug}:${malId}`).setLabel('↩️ Deshacer mi voto').setStyle(ButtonStyle.Secondary),
-		);
-	}
-
-	return secondRow.components.length > 0 ? [voteRow, secondRow] : [voteRow];
+	const undoRow = new ActionRowBuilder().addComponents(
+		new ButtonBuilder().setCustomId(`undovote:${seasonSlug}:${malId}`).setLabel('↩️ Deshacer mi voto').setStyle(ButtonStyle.Secondary),
+	);
+	return [voteRow, episodeRow, undoRow];
 }
 
-module.exports = { buildAnimeEmbed, buildVoteRow };
+module.exports = { buildAnimeEmbed, buildVoteRow, buildEpisodeButtonRow };

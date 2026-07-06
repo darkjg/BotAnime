@@ -6,7 +6,7 @@ const data = buildTemporadaCommandData(
 );
 
 async function execute(interaction) {
-	await runTemporadaCommand(interaction, 'foro');
+	await runTemporadaCommand(interaction);
 }
 
 module.exports = { data, execute };
