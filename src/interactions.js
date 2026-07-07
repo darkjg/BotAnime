@@ -1,10 +1,24 @@
-const { ActionRowBuilder, StringSelectMenuBuilder, UserSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
+const { ActionRowBuilder, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
 const { getTrailers, hasPrequel } = require('./services/jikan');
 const { setVote, clearVote } = require('./services/sheets');
-const { recordVote, removeVote, upsertAnime, getVoteRole, getVoteState, addEpisodesWatched, getProgressForAnime } = require('./services/db');
+const {
+	recordVote,
+	removeVote,
+	upsertAnime,
+	getVoteRole,
+	getVoteState,
+	getUserVote,
+	addEpisodesWatched,
+	getEpisodesWatched,
+	getProgressForAnime,
+} = require('./services/db');
 const { getAnime, rememberAnime, getSeasonLabel } = require('./seasonCache');
 const { handleSeasonSelect, handleSeasonConfirm } = require('./commands/temporadaShared');
 const { buildAnimeEmbed, buildVoteRow } = require('./components');
+
+// Discord no permite filtrar por rol un UserSelectMenu (solo existe para Role Select), así que el
+// filtro se aplica después de elegir: a "Actualizar capítulo" solo pueden entrar quienes tengan este rol.
+const EPISODE_UPDATE_ROLE_ID = '1508943288311480370';
 
 async function handleVoteButton(interaction, voteType, seasonSlug, malId) {
 	const voteRoleId = getVoteRole(interaction.guildId);
@@ -37,7 +51,8 @@ async function handleVoteButton(interaction, voteType, seasonSlug, malId) {
 	const animeForSheet =
 		voteType === 'rojo' ? anime : { ...anime, isSequel: anime.isSequel || (await hasPrequel(anime.malId)) };
 	if (voteType !== 'rojo') rememberAnime(animeForSheet);
-	await setVote(seasonLabel, username, animeForSheet, voteType);
+	const episodesWatched = getEpisodesWatched({ seasonLabel, malId: anime.malId, discordId: interaction.member.id });
+	await setVote(seasonLabel, username, animeForSheet, voteType, episodesWatched);
 
 	if (voteType === 'rojo') {
 		removeVote({ seasonLabel, malId: anime.malId, discordId: interaction.member.id });
@@ -124,6 +139,28 @@ async function handleEpisodePickButton(interaction, seasonSlug, malId) {
 		return;
 	}
 
+	// El selector nativo de usuarios de Discord (UserSelectMenu) busca sobre la lista de miembros que
+	// el cliente de Discord tiene cargada, y en servidores grandes no siempre encuentra a todos por
+	// nombre; además no se puede restringir por rol. Por eso se arma un StringSelectMenu a mano listando
+	// directamente (desde la caché del bot) a quienes tienen el rol, así siempre aparecen y quedan
+	// automáticamente filtrados.
+	if (interaction.guild.members.cache.size < interaction.guild.memberCount) {
+		try {
+			await interaction.guild.members.fetch();
+		} catch (err) {
+			console.error('[interactions] no pude refrescar la lista de miembros para el selector de capítulo:', err.message);
+		}
+	}
+	const eligible = interaction.guild.members.cache
+		.filter((member) => member.roles.cache.has(EPISODE_UPDATE_ROLE_ID))
+		.map((member) => ({ id: member.id, displayName: member.displayName }))
+		.sort((a, b) => a.displayName.localeCompare(b.displayName));
+
+	if (eligible.length === 0) {
+		await interaction.reply({ content: 'Nadie en el servidor tiene el rol necesario para actualizar capítulos.', ephemeral: true });
+		return;
+	}
+
 	// El selector de usuarios y el modal de cantidad son interacciones separadas de ésta; hace falta
 	// guardar a qué anime/temporada/mensaje corresponden para poder retomarlo en cada paso siguiente.
 	const token = interaction.id;
@@ -136,14 +173,18 @@ async function handleEpisodePickButton(interaction, seasonSlug, malId) {
 		messageId: interaction.message.id,
 	});
 
-	const select = new UserSelectMenuBuilder()
+	// Discord no deja más de 25 opciones por selector; con más gente con el rol que eso, se recorta y
+	// se avisa en vez de romper el comando.
+	const truncated = eligible.length > 25;
+	const select = new StringSelectMenuBuilder()
 		.setCustomId(`episodeusers:${token}`)
 		.setPlaceholder('Elige a quién actualizar')
 		.setMinValues(1)
-		.setMaxValues(25);
+		.setMaxValues(Math.min(eligible.length, 25))
+		.addOptions(eligible.slice(0, 25).map((u) => ({ label: u.displayName, value: u.id })));
 
 	await interaction.reply({
-		content: `¿A quién le actualizamos el capítulo de **${anime.title}**?`,
+		content: `¿A quién le actualizamos el capítulo de **${anime.title}**?${truncated ? ' (mostrando los primeros 25 con el rol)' : ''}`,
 		components: [new ActionRowBuilder().addComponents(select)],
 		ephemeral: true,
 	});
@@ -156,10 +197,26 @@ async function handleEpisodeUsersSelect(interaction, token) {
 		return;
 	}
 
-	cached.users = interaction.values.map((id) => ({
-		id,
-		displayName: interaction.members?.get(id)?.displayName ?? interaction.users.get(id)?.username ?? id,
-	}));
+	// El selector ya solo ofrecía gente con el rol; este re-chequeo es solo por si a alguien se lo
+	// sacaron justo entre que se abrió el selector y se envió la elección.
+	const selected = interaction.values.map((id) => {
+		const member = interaction.guild.members.cache.get(id);
+		return { id, displayName: member?.displayName ?? id, hasRole: member?.roles.cache.has(EPISODE_UPDATE_ROLE_ID) ?? false };
+	});
+
+	const withoutRole = selected.filter((u) => !u.hasRole);
+	const users = selected.filter((u) => u.hasRole);
+
+	if (users.length === 0) {
+		await interaction.update({
+			content: `Ninguno de los elegidos tiene el rol necesario, no se actualizó nada: ${withoutRole.map((u) => `**${u.displayName}**`).join(', ')}.`,
+			components: [],
+		});
+		return;
+	}
+
+	cached.users = users;
+	cached.withoutRole = withoutRole;
 
 	const modal = new ModalBuilder().setCustomId(`episodeamount:${token}`).setTitle('Actualizar capítulo');
 	const amountInput = new TextInputBuilder()
@@ -174,30 +231,47 @@ async function handleEpisodeUsersSelect(interaction, token) {
 }
 
 async function handleEpisodeAmountModal(interaction, token) {
+	// Lo que sigue escribe en Sheets y edita el mensaje del hilo, que puede tardar más de los 3
+	// segundos que da Discord para responder sin deferir; sin este defer, cualquier lentitud (cuota de
+	// Sheets, rate limit) hace que el reply final falle con "Unknown interaction" aunque el capítulo sí
+	// se haya actualizado.
+	await interaction.deferReply({ ephemeral: true });
+
 	const cached = interaction.client.episodeFlowCache?.get(token);
 	interaction.client.episodeFlowCache?.delete(token);
 	if (!cached?.users) {
-		await interaction.reply({ content: 'Esto ya expiró, usa el botón de "Actualizar capítulo" de nuevo.', ephemeral: true });
+		await interaction.editReply('Esto ya expiró, usa el botón de "Actualizar capítulo" de nuevo.');
 		return;
 	}
 
 	const raw = interaction.fields.getTextInputValue('amount').trim();
 	const delta = Number(raw);
 	if (!Number.isInteger(delta) || delta === 0) {
-		await interaction.reply({ content: `"${raw}" no es un número entero válido (probá con 1, -1, 3, etc).`, ephemeral: true });
+		await interaction.editReply(`"${raw}" no es un número entero válido (probá con 1, -1, 3, etc).`);
 		return;
 	}
 
-	const { seasonLabel, malId, animeTitle, channelId, messageId, users } = cached;
+	const { seasonLabel, malId, animeTitle, channelId, messageId, users, withoutRole } = cached;
+	const anime = getAnime(malId);
 	for (const { id, displayName } of users) {
-		addEpisodesWatched({ seasonLabel, malId, discordId: id, displayName, delta });
+		const episodesWatched = addEpisodesWatched({ seasonLabel, malId, discordId: id, displayName, delta });
+
+		// Si ya tiene un voto puesto, la celda de la sheet queda vieja hasta que se refresque con el
+		// capítulo nuevo; si no votó (o votó rojo), no hay celda que actualizar.
+		const vote = getUserVote({ seasonLabel, malId, discordId: id });
+		if (vote && vote.voteType !== 'rojo') {
+			try {
+				await setVote(seasonLabel, displayName, anime, vote.voteType, episodesWatched);
+			} catch (err) {
+				console.error(`[interactions] no pude refrescar la celda de "${displayName}" en la sheet:`, err.message);
+			}
+		}
 	}
 
 	console.log(
 		`[interactions] ${interaction.member.displayName} sumó ${delta > 0 ? '+' : ''}${delta} capítulo(s) a ${users.length} persona(s) para "${animeTitle}" (${seasonLabel})`,
 	);
 
-	const anime = getAnime(malId);
 	const voteState = getVoteState({ seasonLabel, malId });
 	const progress = getProgressForAnime({ seasonLabel, malId });
 
@@ -213,10 +287,9 @@ async function handleEpisodeAmountModal(interaction, token) {
 	}
 
 	const names = users.map((u) => `**${u.displayName}**`).join(', ');
-	await interaction.reply({
-		content: `Listo: ${delta > 0 ? '+' : ''}${delta} capítulo(s) para ${names} en **${animeTitle}**.`,
-		ephemeral: true,
-	});
+	const skippedNote =
+		withoutRole?.length > 0 ? ` (sin actualizar por no tener el rol: ${withoutRole.map((u) => `**${u.displayName}**`).join(', ')})` : '';
+	await interaction.editReply(`Listo: ${delta > 0 ? '+' : ''}${delta} capítulo(s) para ${names} en **${animeTitle}**.${skippedNote}`);
 }
 
 async function handleTrailerButton(interaction, malId) {
@@ -299,12 +372,7 @@ async function handleInteraction(interaction) {
 		} else if (interaction.customId === 'seasonselect') {
 			const [year, season] = interaction.values[0].split(':');
 			await handleSeasonSelect(interaction, year, season);
-		}
-		return;
-	}
-
-	if (interaction.isUserSelectMenu()) {
-		if (interaction.customId.startsWith('episodeusers:')) {
+		} else if (interaction.customId.startsWith('episodeusers:')) {
 			const token = interaction.customId.split(':')[1];
 			await handleEpisodeUsersSelect(interaction, token);
 		}

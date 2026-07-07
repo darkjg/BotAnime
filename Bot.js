@@ -7,8 +7,11 @@ const temporadaReconstruir = require('./src/commands/temporadaReconstruir');
 const avisos = require('./src/commands/avisos');
 const votoRol = require('./src/commands/votoRol');
 const capitulo = require('./src/commands/capitulo');
+const recargaCaps = require('./src/commands/recargaCaps');
+
 const { handleInteraction } = require('./src/interactions');
-const { startEpisodeNotifier, startAv1EpisodeNotifier } = require('./src/scheduler');
+const { startAv1EpisodeNotifier } = require('./src/scheduler');
+
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers] });
 
@@ -19,10 +22,12 @@ client.commands.set(temporadaReconstruir.data.name, temporadaReconstruir);
 client.commands.set(avisos.data.name, avisos);
 client.commands.set(votoRol.data.name, votoRol);
 client.commands.set(capitulo.data.name, capitulo);
+client.commands.set(recargaCaps.data.name, recargaCaps);
+
+
 
 client.once('clientReady', () => {
 	console.log(`Conectado como ${client.user.tag}`);
-	startEpisodeNotifier(client);
 	startAv1EpisodeNotifier(client);
 });
 

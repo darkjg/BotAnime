@@ -1,5 +1,14 @@
 const { SlashCommandBuilder } = require('discord.js');
-const { getAnimeForSeason, getActiveSeason, getVoteRole, setEpisodesWatched, getEpisodesWatched, getUserVotedAnime } = require('../services/db');
+const {
+	getAnimeForSeason,
+	getActiveSeason,
+	getVoteRole,
+	setEpisodesWatched,
+	getEpisodesWatched,
+	getUserVotedAnime,
+	getUserVote,
+} = require('../services/db');
+const { setVote } = require('../services/sheets');
 const { getAnime } = require('../seasonCache');
 
 const data = new SlashCommandBuilder()
@@ -91,6 +100,17 @@ async function execute(interaction) {
 	const displayName = targetMember?.displayName ?? targetUser.username;
 
 	const episodesWatched = setEpisodesWatched({ seasonLabel, malId, discordId: targetUser.id, displayName, episodesWatched: newCount });
+
+	// Si ya tiene un voto puesto, la celda de la sheet queda vieja hasta que se refresque con el
+	// capítulo nuevo; si no votó (o votó rojo), no hay celda que actualizar.
+	const vote = getUserVote({ seasonLabel, malId, discordId: targetUser.id });
+	if (vote && vote.voteType !== 'rojo') {
+		try {
+			await setVote(seasonLabel, displayName, anime, vote.voteType, episodesWatched);
+		} catch (err) {
+			console.error(`[capitulo] no pude refrescar la celda de "${displayName}" en la sheet:`, err.message);
+		}
+	}
 
 	console.log(`[capitulo] ${interaction.user.tag} puso a ${displayName} en el capítulo ${episodesWatched} de "${anime.title}" (${seasonLabel})`);
 

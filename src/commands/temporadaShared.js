@@ -15,7 +15,10 @@ const {
 	getVoteState,
 	getForumChannel,
 	setForumChannel,
+	setAv1ForumThread,
+	setLastNotifiedAv1Episode,
 	setActiveSeason,
+
 	getVoteRole,
 	getVotesForSeason,
 	recordVote,
@@ -240,10 +243,9 @@ async function carryOverVotesAndProgress(previousSeasonLabel, seasonLabel, anime
 
 	for (const vote of previousVotes) {
 		try {
-			await setVote(seasonLabel, vote.displayName, anime, vote.voteType);
-			recordVote({ seasonLabel, malId: anime.malId, discordId: vote.discordId, displayName: vote.displayName, voteType: vote.voteType });
-
 			const previousEpisodes = getEpisodesWatched({ seasonLabel: previousSeasonLabel, malId: anime.malId, discordId: vote.discordId });
+			await setVote(seasonLabel, vote.displayName, anime, vote.voteType, previousEpisodes);
+			recordVote({ seasonLabel, malId: anime.malId, discordId: vote.discordId, displayName: vote.displayName, voteType: vote.voteType });
 			if (previousEpisodes > 0) {
 				setEpisodesWatched({
 					seasonLabel,
@@ -376,6 +378,7 @@ async function publishSeasonForum({ interaction, respond, year, season, nombreOv
 	const guild = interaction.guild ?? (await interaction.client.guilds.fetch(interaction.guildId));
 	const commandChannel = interaction.channel ?? (await interaction.client.channels.fetch(interaction.channelId));
 
+
 	const prepared = await prepareSeason({ guildId: guild.id, year, season, nombreOverride });
 	if (!prepared) {
 		await respond('No encontré animes para esa temporada.');
@@ -412,7 +415,7 @@ async function publishSeasonForum({ interaction, respond, year, season, nombreOv
 		const results = await Promise.allSettled(
 			batch.map(async (entry) => {
 				const voteState = getVoteState({ seasonLabel, malId: entry.malId });
-				await forumChannel.threads.create({
+				const thread = await forumChannel.threads.create({
 					name: entry.title.slice(0, 100),
 					message: {
 						embeds: [buildAnimeEmbed(entry, { voteState })],
@@ -423,7 +426,14 @@ async function publishSeasonForum({ interaction, respond, year, season, nombreOv
 					},
 					appliedTags: [tagIdFor(forumChannel, entry)].filter(Boolean),
 				});
+
+				setAv1ForumThread({ guildId: guild.id, seasonLabel, malId: entry.malId, threadId: thread.id });
+				// El hilo es nuevo y arranca vacío: si quedaba un "último episodio avisado" de una
+				// publicación anterior de este mismo anime+temporada, /recarga (o el aviso automático)
+				// creería que ya está al día y no postearía nada en el hilo recién creado.
+				setLastNotifiedAv1Episode({ seasonLabel, malId: entry.malId, guildId: guild.id, episode: 0 });
 				return entry.title;
+
 			}),
 		);
 

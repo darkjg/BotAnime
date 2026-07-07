@@ -1,5 +1,5 @@
 const { deleteSeasonTab, ensureSeasonTab, ensureAnimeColumn, setVote } = require('./services/sheets');
-const { getAnimeForSeason, getVotesForSeason } = require('./services/db');
+const { getAnimeForSeason, getVotesForSeason, getEpisodesWatched } = require('./services/db');
 
 // Cada ensureAnimeColumn/setVote dispara varias llamadas de lectura a la API de Sheets (buscar
 // columna, leer día de emisión, revisar huecos...). Reconstruir una temporada entera vota "de nuevo"
@@ -38,7 +38,8 @@ async function rebuildSeasonTab(seasonLabel) {
 		if (vote.voteType === 'rojo') continue;
 		const anime = animeByMalId.get(vote.malId);
 		if (!anime) continue;
-		await setVote(seasonLabel, vote.displayName, anime, vote.voteType);
+		const episodesWatched = getEpisodesWatched({ seasonLabel, malId: vote.malId, discordId: vote.discordId });
+		await setVote(seasonLabel, vote.displayName, anime, vote.voteType, episodesWatched);
 		votesApplied += 1;
 		await sleep(THROTTLE_MS);
 	}

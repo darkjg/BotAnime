@@ -15,11 +15,19 @@ function emptyStore() {
 		notifiedEpisodes: {},
 		av1NotifiedEpisodes: {},
 		forumChannels: {},
+		// malId/seasonLabel -> Discord threadId donde se publica el hilo del anime en el foro
+		av1ForumThreads: {},
 		activeSeasons: {},
+
 		voteRoles: {},
 		progress: {},
+		notifyWindows: {},
 	};
 }
+
+// Ventana horaria por defecto en la que se manda el aviso de "hoy sale capítulo" (hora local del
+// servidor). endHour es exclusivo: 23 significa "hasta las 22:59".
+const DEFAULT_NOTIFY_WINDOW = { startHour: 17, endHour: 23 };
 
 function loadStore() {
 	if (!fs.existsSync(DB_PATH)) return emptyStore();
@@ -46,9 +54,16 @@ function save() {
 	fs.writeFileSync(DB_PATH, JSON.stringify(store, null, 1));
 }
 
-const animeKey = (malId, seasonLabel) => `${seasonLabel}::${malId}`;
+// Incluye guildId porque dos guilds pueden compartir la misma etiqueta de temporada (ej. un guild de
+// pruebas y el de producción publicando "Verano 2026" a la vez); sin el guildId en la clave, el
+// segundo que corriera /temporada-foro pisaría el guildId guardado por el primero para todo malId
+// repetido, aunque cada uno tenga su propio canal de foro.
+const animeKey = (malId, seasonLabel, guildId) => `${guildId}::${seasonLabel}::${malId}`;
+// Incluye guildId por el mismo motivo que animeKey: si dos guilds comparten etiqueta de temporada,
+// el "último episodio avisado" de uno no debe afectar al del otro (ej. al recrear el hilo de un
+// guild de pruebas no hay que resetear el contador del hilo real de producción).
+const av1NotifiedKey = (malId, seasonLabel, guildId) => `${guildId}::${seasonLabel}::${malId}`;
 const voteKey = (seasonLabel, malId, discordId) => `${seasonLabel}::${malId}::${discordId}`;
-const notifiedKey = (seasonLabel, malId, dateKey) => `${seasonLabel}::${malId}::${dateKey}`;
 const progressKey = (seasonLabel, malId, discordId) => `${seasonLabel}::${malId}::${discordId}`;
 
 // Recuerda un anime publicado (título, día de emisión, a qué server/temporada pertenece) para que
@@ -57,8 +72,8 @@ const progressKey = (seasonLabel, malId, discordId) => `${seasonLabel}::${malId}
 // no se conocen todavía cuando se publica la temporada (se resuelven recién al votar, o al detectar
 // carryover); por eso esto hace merge campo por campo en vez de pisar el registro entero, así una
 // llamada posterior puede completar isSequel/imageUrl sin perder lo que ya había.
-function upsertAnime({ malId, seasonLabel, guildId, title, url, imageUrl, broadcastDay, isSequel, isCarryover }) {
-	const key = animeKey(malId, seasonLabel);
+function upsertAnime({ malId, seasonLabel, guildId, title, url, imageUrl, broadcastDay, isSequel, isCarryover, slug }) {
+	const key = animeKey(malId, seasonLabel, guildId);
 	const existing = store.anime[key] ?? {};
 	store.anime[key] = {
 		malId,
@@ -70,6 +85,7 @@ function upsertAnime({ malId, seasonLabel, guildId, title, url, imageUrl, broadc
 		broadcastDay: broadcastDay ?? existing.broadcastDay ?? null,
 		isSequel: isSequel ?? existing.isSequel ?? false,
 		isCarryover: isCarryover ?? existing.isCarryover ?? false,
+		slug: slug ?? existing.slug ?? null,
 	};
 	save();
 }
@@ -123,6 +139,12 @@ function getWatchers({ seasonLabel, malId }) {
 	return Object.values(store.votes)
 		.filter((v) => v.seasonLabel === seasonLabel && v.malId === malId && (v.voteType === 'verde' || v.voteType === 'naranja'))
 		.map((v) => v.discordId);
+}
+
+// El voto de una persona puntual para un anime, o null si no votó. Se usa para saber si hay que
+// refrescar la celda de la sheet (con el capítulo nuevo) cuando cambia su progreso.
+function getUserVote({ seasonLabel, malId, discordId }) {
+	return store.votes[voteKey(seasonLabel, malId, discordId)] ?? null;
 }
 
 // malId de los animes que esta persona votó verde/naranja en la temporada (para el autocompletado de
@@ -181,26 +203,24 @@ function getNotificationChannel(guildId) {
 	return store.notificationChannels[guildId] ?? null;
 }
 
-function getAnimeAiringOn(dayLabel) {
-	return Object.values(store.anime).filter((a) => a.broadcastDay === dayLabel);
+// Último episodio de animeav1 ya avisado para este anime, para no repetir el aviso en cada chequeo.
+function getLastNotifiedAv1Episode({ seasonLabel, malId, guildId }) {
+	return store.av1NotifiedEpisodes[av1NotifiedKey(malId, seasonLabel, guildId)] ?? 0;
 }
 
-function wasNotifiedToday({ seasonLabel, malId, dateKey }) {
-	return Boolean(store.notifiedEpisodes[notifiedKey(seasonLabel, malId, dateKey)]);
-}
-
-function markNotifiedToday({ seasonLabel, malId, dateKey }) {
-	store.notifiedEpisodes[notifiedKey(seasonLabel, malId, dateKey)] = true;
+function setLastNotifiedAv1Episode({ seasonLabel, malId, guildId, episode }) {
+	store.av1NotifiedEpisodes[av1NotifiedKey(malId, seasonLabel, guildId)] = episode;
 	save();
 }
 
-// Último episodio de animeav1 ya avisado para este anime, para no repetir el aviso en cada chequeo.
-function getLastNotifiedAv1Episode({ seasonLabel, malId }) {
-	return store.av1NotifiedEpisodes[animeKey(malId, seasonLabel)] ?? 0;
+// Ventana horaria del aviso de "hoy sale capítulo" para un guild (ver DEFAULT_NOTIFY_WINDOW). Guardado
+// por guild para poder ajustarla con un comando más adelante sin afectar a otros servidores.
+function getNotifyWindow(guildId) {
+	return store.notifyWindows[guildId] ?? DEFAULT_NOTIFY_WINDOW;
 }
 
-function setLastNotifiedAv1Episode({ seasonLabel, malId, episode }) {
-	store.av1NotifiedEpisodes[animeKey(malId, seasonLabel)] = episode;
+function setNotifyWindow({ guildId, startHour, endHour }) {
+	store.notifyWindows[guildId] = { startHour, endHour };
 	save();
 }
 
@@ -224,11 +244,26 @@ function setForumChannel({ guildId, channelId, seasonLabel }) {
 	save();
 }
 
+function av1ThreadKey({ guildId, seasonLabel, malId }) {
+	return `${guildId}::${seasonLabel}::${malId}`;
+}
+
+function setAv1ForumThread({ guildId, seasonLabel, malId, threadId }) {
+	store.av1ForumThreads[av1ThreadKey({ guildId, seasonLabel, malId })] = threadId;
+	save();
+}
+
+function getAv1ForumThread({ guildId, seasonLabel, malId }) {
+	return store.av1ForumThreads[av1ThreadKey({ guildId, seasonLabel, malId })] ?? null;
+}
+
 module.exports = {
+
 	upsertAnime,
 	recordVote,
 	removeVote,
 	getWatchers,
+	getUserVote,
 	getVoteState,
 	getUserVotedAnime,
 	addEpisodesWatched,
@@ -237,16 +272,18 @@ module.exports = {
 	getProgressForAnime,
 	setNotificationChannel,
 	getNotificationChannel,
-	getAnimeAiringOn,
-	wasNotifiedToday,
-	markNotifiedToday,
 	getLastNotifiedAv1Episode,
 	setLastNotifiedAv1Episode,
+	getNotifyWindow,
+	setNotifyWindow,
 	getVoteRole,
 	setVoteRole,
 	getForumChannel,
 	setForumChannel,
+	getAv1ForumThread,
+	setAv1ForumThread,
 	getAnimeForSeason,
+
 	getAllAnime,
 	getVotesForSeason,
 	setActiveSeason,

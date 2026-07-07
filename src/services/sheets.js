@@ -56,9 +56,9 @@ function enqueue(seasonName, task) {
 }
 
 const VOTE_STYLES = {
-	verde: { label: '0', color: { red: 0, green: 1, blue: 0 } },
-	naranja: { label: '0', color: { red: 1, green: 0.6, blue: 0 } },
-	rojo: { label: '0', color: { red: 1, green: 0, blue: 0 } },
+	verde: { color: { red: 0, green: 1, blue: 0 } },
+	naranja: { color: { red: 1, green: 0.6, blue: 0 } },
+	rojo: { color: { red: 1, green: 0, blue: 0 } },
 };
 
 const LEGEND = [
@@ -908,8 +908,10 @@ async function ensureUserRowImpl(seasonName, username, userStart) {
 	return dayRowIndex;
 }
 
-// "No lo veré" (rojo) nunca se escribe en la sheet: ni columna, ni fila, ni voto.
-async function setVoteImpl(seasonName, username, anime, voteType) {
+// "No lo veré" (rojo) nunca se escribe en la sheet: ni columna, ni fila, ni voto. episodesWatched es
+// el capítulo real por el que va esa persona (ver services/db.js) — la celda siempre muestra ese
+// número, no un valor fijo, así que hay que volver a llamar a esto cada vez que cambia.
+async function setVoteImpl(seasonName, username, anime, voteType, episodesWatched = 0) {
 	const style = VOTE_STYLES[voteType];
 	if (!style) throw new Error(`Voto desconocido: ${voteType}`);
 	if (voteType === 'rojo') return;
@@ -925,7 +927,7 @@ async function setVoteImpl(seasonName, username, anime, voteType) {
 		spreadsheetId: SPREADSHEET_ID,
 		range: `'${seasonName}'!${cellA1}`,
 		valueInputOption: 'USER_ENTERED',
-		requestBody: { values: [[style.label]] },
+		requestBody: { values: [[String(episodesWatched)]] },
 	});
 
 	const checkboxRange = {
@@ -1138,8 +1140,8 @@ function ensureUserRow(seasonName, username, userStart) {
 	return enqueue(seasonName, () => ensureUserRowImpl(seasonName, username, userStart));
 }
 
-function setVote(seasonName, username, anime, voteType) {
-	return enqueue(seasonName, () => setVoteImpl(seasonName, username, anime, voteType));
+function setVote(seasonName, username, anime, voteType, episodesWatched = 0) {
+	return enqueue(seasonName, () => setVoteImpl(seasonName, username, anime, voteType, episodesWatched));
 }
 
 function clearVote(seasonName, username, anime) {

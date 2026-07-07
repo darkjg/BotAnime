@@ -6,6 +6,7 @@ const temporadaReconstruir = require('./src/commands/temporadaReconstruir');
 const avisos = require('./src/commands/avisos');
 const votoRol = require('./src/commands/votoRol');
 const capitulo = require('./src/commands/capitulo');
+const recargaCaps = require('./src/commands/recargaCaps');
 
 const commands = [
 	temporadaForo.data.toJSON(),
@@ -14,11 +15,13 @@ const commands = [
 	avisos.data.toJSON(),
 	votoRol.data.toJSON(),
 	capitulo.data.toJSON(),
+	recargaCaps.data.toJSON(),
 ];
 
 const rest = new REST().setToken(process.env.DISCORD_TOKEN);
 
 // GUILD_ID es el servidor de producción; TEST_GUILD_ID (opcional) es un servidor aparte para probar
+
 // sin afectarlo. Si no hay ninguno de los dos, se registran como comandos globales.
 const guildIds = [process.env.GUILD_ID, process.env.TEST_GUILD_ID].filter(Boolean);
 
