@@ -7,6 +7,10 @@ const avisos = require('./src/commands/avisos');
 const votoRol = require('./src/commands/votoRol');
 const capitulo = require('./src/commands/capitulo');
 const recargaCaps = require('./src/commands/recargaCaps');
+const enComun = require('./src/commands/enComun');
+const pendientes = require('./src/commands/pendientes');
+const refrescarHilos = require('./src/commands/refrescarHilos');
+const linkFix = require('./src/commands/linkFix');
 
 const commands = [
 	temporadaForo.data.toJSON(),
@@ -16,6 +20,10 @@ const commands = [
 	votoRol.data.toJSON(),
 	capitulo.data.toJSON(),
 	recargaCaps.data.toJSON(),
+	enComun.data.toJSON(),
+	pendientes.data.toJSON(),
+	refrescarHilos.data.toJSON(),
+	linkFix.data.toJSON(),
 ];
 
 const rest = new REST().setToken(process.env.DISCORD_TOKEN);

@@ -338,36 +338,58 @@ async function writeAnimeBlock(sheets, sheetId, title, anime, voteCol, imageRow,
 
 // Envuelve solo el subgrupo "CONTINUAN" en un borde negro más grueso, recalculando su ancho
 // actual cada vez que se agrega una columna nueva. Las secuelas no llevan este borde.
-async function applyContinuacionOuterBorder(sheets, sheetId, title, layout) {
+async function applyContinuacionOuterBorder(sheets, sheet, title, layout) {
+	const sheetId = sheet.properties.sheetId;
 	const siguenStartCol = await findColumnWithLabel(sheets, title, layout.labelRow, SIGUEN_LABEL);
 	if (siguenStartCol === null) return;
 
-	const siguenMalIds = await getMalIdsInRange(sheets, title, layout.titleRow, siguenStartCol);
-	const endColumnIndex = siguenStartCol + siguenMalIds.length * 2;
+	// getMalIdsInRange sin límite de columna lee hasta el borde de TODA la grilla (que suele tener
+	// muchas más columnas vacías que animes reales), inflando el borde grueso mucho más allá del bloque
+	// real — el bug de "bordes infinitos". Se usa la máscara de ocupación y se corta en el primer hueco
+	// para saber dónde termina de verdad el subgrupo.
+	const occupied = await getOccupiedMask(sheets, title, layout.titleRow, siguenStartCol);
+	let count = 0;
+	while (count < occupied.length && occupied[count]) count += 1;
+	const endColumnIndex = siguenStartCol + count * 2;
 
-	await sheets.spreadsheets.batchUpdate({
-		spreadsheetId: SPREADSHEET_ID,
-		requestBody: {
-			requests: [
-				{
-					updateBorders: {
-						range: {
-							sheetId,
-							startRowIndex: layout.labelRow - 1,
-							endRowIndex: layout.dayRowIndex,
-							startColumnIndex: siguenStartCol,
-							endColumnIndex,
-						},
-						top: THICK_BLACK_BORDER,
-						bottom: THICK_BLACK_BORDER,
-						left: THICK_BLACK_BORDER,
-						right: THICK_BLACK_BORDER,
-						innerVertical: THIN_BLACK_BORDER,
-					},
+	const requests = [];
+	// Limpia cualquier borde grueso que haya quedado mal aplicado más allá del bloque real (de corridas
+	// anteriores con el cálculo viejo), para que no reaparezca solo aunque se borre a mano.
+	const gridEnd = sheet.properties.gridProperties.columnCount;
+	if (gridEnd > endColumnIndex) {
+		requests.push({
+			updateBorders: {
+				range: { sheetId, startRowIndex: layout.labelRow - 1, endRowIndex: layout.dayRowIndex, startColumnIndex: endColumnIndex, endColumnIndex: gridEnd },
+				top: { style: 'NONE' },
+				bottom: { style: 'NONE' },
+				left: { style: 'NONE' },
+				right: { style: 'NONE' },
+				innerVertical: { style: 'NONE' },
+			},
+		});
+	}
+
+	if (count > 0) {
+		requests.push({
+			updateBorders: {
+				range: {
+					sheetId,
+					startRowIndex: layout.labelRow - 1,
+					endRowIndex: layout.dayRowIndex,
+					startColumnIndex: siguenStartCol,
+					endColumnIndex,
 				},
-			],
-		},
-	});
+				top: THICK_BLACK_BORDER,
+				bottom: THICK_BLACK_BORDER,
+				left: THICK_BLACK_BORDER,
+				right: THICK_BLACK_BORDER,
+				innerVertical: THIN_BLACK_BORDER,
+			},
+		});
+	}
+
+	if (requests.length === 0) return;
+	await sheets.spreadsheets.batchUpdate({ spreadsheetId: SPREADSHEET_ID, requestBody: { requests } });
 }
 
 async function writeLegendAndHeader(sheets, sheetId, title) {
@@ -764,7 +786,7 @@ async function repairSeasonTabImpl(seasonName) {
 			);
 		}
 
-		await applyContinuacionOuterBorder(sheets, sheetId, seasonName, layout);
+		await applyContinuacionOuterBorder(sheets, sheet, seasonName, layout);
 	}
 
 	invalidateColumnCache(seasonName);
@@ -835,7 +857,7 @@ async function ensureAnimeColumnImpl(seasonName, anime) {
 		}
 		await ensureColumnCapacity(sheets, sheet, targetCol);
 		await writeAnimeBlock(sheets, sheet.properties.sheetId, seasonName, anime, targetCol, layout.imageRow, layout.titleRow, layout.dayRowIndex);
-		await applyContinuacionOuterBorder(sheets, sheet.properties.sheetId, seasonName, layout);
+		await applyContinuacionOuterBorder(sheets, sheet, seasonName, layout);
 		invalidateColumnCache(seasonName);
 		return { animeIndex: targetCol, userStart: layout.userStart };
 	}
@@ -871,7 +893,7 @@ async function ensureAnimeColumnImpl(seasonName, anime) {
 	}
 	await ensureColumnCapacity(sheets, sheet, targetCol);
 	await writeAnimeBlock(sheets, sheet.properties.sheetId, seasonName, anime, targetCol, layout.imageRow, layout.titleRow, layout.dayRowIndex);
-	await applyContinuacionOuterBorder(sheets, sheet.properties.sheetId, seasonName, layout);
+	await applyContinuacionOuterBorder(sheets, sheet, seasonName, layout);
 	invalidateColumnCache(seasonName);
 	return { animeIndex: targetCol, userStart: layout.userStart };
 }
@@ -911,7 +933,7 @@ async function ensureUserRowImpl(seasonName, username, userStart) {
 // "No lo veré" (rojo) nunca se escribe en la sheet: ni columna, ni fila, ni voto. episodesWatched es
 // el capítulo real por el que va esa persona (ver services/db.js) — la celda siempre muestra ese
 // número, no un valor fijo, así que hay que volver a llamar a esto cada vez que cambia.
-async function setVoteImpl(seasonName, username, anime, voteType, episodesWatched = 0) {
+async function setVoteImpl(seasonName, username, anime, voteType, episodesWatched = 0, caughtUpThisWeek = false) {
 	const style = VOTE_STYLES[voteType];
 	if (!style) throw new Error(`Voto desconocido: ${voteType}`);
 	if (voteType === 'rojo') return;
@@ -961,6 +983,20 @@ async function setVoteImpl(seasonName, username, anime, voteType, episodesWatche
 						rule: { condition: { type: 'BOOLEAN' }, strict: true },
 					},
 				},
+				// Solo tilda; nunca destilda desde acá (un catch-up de capítulos viejos no cuenta, pero
+				// tampoco borra un check ya puesto). El reset semanal del check lo hace un script aparte de
+				// la sheet, los domingos.
+				...(caughtUpThisWeek
+					? [
+							{
+								repeatCell: {
+									range: checkboxRange,
+									cell: { userEnteredValue: { boolValue: true } },
+									fields: 'userEnteredValue.boolValue',
+								},
+							},
+						]
+					: []),
 			],
 		},
 	});
@@ -1140,8 +1176,8 @@ function ensureUserRow(seasonName, username, userStart) {
 	return enqueue(seasonName, () => ensureUserRowImpl(seasonName, username, userStart));
 }
 
-function setVote(seasonName, username, anime, voteType, episodesWatched = 0) {
-	return enqueue(seasonName, () => setVoteImpl(seasonName, username, anime, voteType, episodesWatched));
+function setVote(seasonName, username, anime, voteType, episodesWatched = 0, caughtUpThisWeek = false) {
+	return enqueue(seasonName, () => setVoteImpl(seasonName, username, anime, voteType, episodesWatched, caughtUpThisWeek));
 }
 
 function clearVote(seasonName, username, anime) {

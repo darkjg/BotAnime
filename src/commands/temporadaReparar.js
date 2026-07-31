@@ -1,5 +1,6 @@
 const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
 const { repairSeasonTab } = require('../services/sheets');
+const { autoCleanupReply } = require('../ephemeral');
 
 const data = new SlashCommandBuilder()
 	.setName('temporada-reparar')
@@ -44,6 +45,7 @@ async function execute(interaction) {
 		console.error(`[temporada-reparar] no pude reparar "${nombre}":`, err.message);
 		await interaction.editReply(`No pude reparar "${nombre}": ${err.message}`);
 	}
+	autoCleanupReply(interaction);
 }
 
 module.exports = { data, execute };

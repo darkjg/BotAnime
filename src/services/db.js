@@ -22,6 +22,12 @@ function emptyStore() {
 		voteRoles: {},
 		progress: {},
 		notifyWindows: {},
+		// malId/seasonLabel/guildId/episodio -> mensaje del hilo de foro con los links de descarga, para
+		// poder revisarlo unos días después y agregar proveedores que tarden más en aparecer (ver
+		// collectDueEpisodeLinkChecks).
+		episodeLinkMessages: {},
+		// guildId -> bool: si /link-fix está activado para reemplazar embeds rotos de x.com/twitter.com.
+		linkFixEnabled: {},
 	};
 }
 
@@ -47,6 +53,24 @@ const store = loadStore();
 // no hace falta correr ningún comando a mano para no perder el comportamiento que ya tenía.
 if (process.env.GUILD_ID && process.env.VOTE_ROLE_ID && !(process.env.GUILD_ID in store.voteRoles)) {
 	store.voteRoles[process.env.GUILD_ID] = process.env.VOTE_ROLE_ID;
+	save();
+}
+
+// Migración: antes av1NotifiedEpisodes guardaba directamente el número de episodio, sin fecha de
+// detección. Al agregar detectedAt (para isCaughtUpThisWeek, el check de "lo vio la semana que
+// salió"), las entradas viejas se quedarían sin fecha para siempre si a ese anime no le vuelven a
+// detectar un episodio nuevo (p. ej. uno que ya terminó de emitir esta temporada), y el check nunca
+// se tildaría para nadie. Se convierten una sola vez acá, usando el momento de este arranque como
+// fecha: no es la fecha real en que salió, pero deja el check utilizable desde ya en vez de nunca.
+let migratedAv1Entries = 0;
+for (const [key, value] of Object.entries(store.av1NotifiedEpisodes)) {
+	if (typeof value === 'number') {
+		store.av1NotifiedEpisodes[key] = { episode: value, detectedAt: Date.now() };
+		migratedAv1Entries += 1;
+	}
+}
+if (migratedAv1Entries > 0) {
+	console.log(`[db] migré ${migratedAv1Entries} entrada(s) vieja(s) de av1NotifiedEpisodes al formato con fecha`);
 	save();
 }
 
@@ -99,6 +123,15 @@ function getAnimeForSeason(seasonLabel) {
 // hace falta, ver seasonCache.js).
 function getAllAnime() {
 	return Object.values(store.anime);
+}
+
+// Todos los registros (uno por guild) de un mismo anime en una temporada. malId identifica al anime
+// en sí, no depende de en qué guild se vio; y el voto/progreso de una persona es un solo hecho real,
+// no "uno por guild". Hoy todos los guilds comparten la misma sheet (SHEET_ID es uno solo), pero si
+// en el futuro cada guild apunta a la suya, escribir el voto en TODOS estos registros asegura que se
+// vea reflejado en cualquier sheet donde el anime esté, sin importar en qué guild se disparó el voto.
+function getAnimeAcrossGuilds({ seasonLabel, malId }) {
+	return getAllAnime().filter((a) => a.seasonLabel === seasonLabel && a.malId === malId);
 }
 
 // Todos los votos de una temporada (para reconstruir su pestaña desde cero).
@@ -175,9 +208,18 @@ function addEpisodesWatched({ seasonLabel, malId, discordId, displayName, delta 
 	return episodesWatched;
 }
 
-// Solo devuelve a quienes tienen progreso > 0, para no mostrar en el embed a todo el mundo en "cap. 0".
-function getProgressForAnime({ seasonLabel, malId }) {
-	return Object.values(store.progress).filter((p) => p.seasonLabel === seasonLabel && p.malId === malId && p.episodesWatched > 0);
+// Todos los que están viendo este anime (voto verde/naranja) con el capítulo por el que van (0 si
+// todavía no lo marcaron): a diferencia de mirar solo la tabla de progreso, esto muestra a TODA la
+// gente que sigue el anime aunque no haya tocado /capitulo todavía, para que el embed del hilo
+// refleje quién lo está viendo, no solo quién ya reportó avance.
+function getWatchersWithProgress({ seasonLabel, malId }) {
+	return Object.values(store.votes)
+		.filter((v) => v.seasonLabel === seasonLabel && v.malId === malId && (v.voteType === 'verde' || v.voteType === 'naranja'))
+		.map((v) => ({
+			discordId: v.discordId,
+			displayName: v.displayName,
+			episodesWatched: getEpisodesWatched({ seasonLabel, malId, discordId: v.discordId }),
+		}));
 }
 
 function getEpisodesWatched({ seasonLabel, malId, discordId }) {
@@ -203,14 +245,47 @@ function getNotificationChannel(guildId) {
 	return store.notificationChannels[guildId] ?? null;
 }
 
+// Lee una entrada de av1NotifiedEpisodes tolerando el formato viejo (antes de agregar detectedAt, la
+// entrada era directamente el número de episodio, sin fecha). Con formato viejo detectedAt queda en
+// null: no hay forma de saber en qué semana se detectó, así que isCaughtUpThisWeek lo trata como "no
+// esta semana" en vez de asumir cualquier cosa.
+function readAv1Entry(key) {
+	const raw = store.av1NotifiedEpisodes[key];
+	if (raw == null) return { episode: 0, detectedAt: null };
+	if (typeof raw === 'number') return { episode: raw, detectedAt: null };
+	return { episode: raw.episode ?? 0, detectedAt: raw.detectedAt ?? null };
+}
+
 // Último episodio de animeav1 ya avisado para este anime, para no repetir el aviso en cada chequeo.
 function getLastNotifiedAv1Episode({ seasonLabel, malId, guildId }) {
-	return store.av1NotifiedEpisodes[av1NotifiedKey(malId, seasonLabel, guildId)] ?? 0;
+	return readAv1Entry(av1NotifiedKey(malId, seasonLabel, guildId)).episode;
 }
 
 function setLastNotifiedAv1Episode({ seasonLabel, malId, guildId, episode }) {
-	store.av1NotifiedEpisodes[av1NotifiedKey(malId, seasonLabel, guildId)] = episode;
+	store.av1NotifiedEpisodes[av1NotifiedKey(malId, seasonLabel, guildId)] = { episode, detectedAt: Date.now() };
 	save();
+}
+
+// Medianoche del lunes de la semana calendario (lunes a domingo) a la que pertenece `timestamp`.
+function startOfCalendarWeek(timestamp) {
+	const d = new Date(timestamp);
+	d.setHours(0, 0, 0, 0);
+	const diffToMonday = (d.getDay() + 6) % 7; // getDay(): 0=domingo, 1=lunes, ...
+	d.setDate(d.getDate() - diffToMonday);
+	return d.getTime();
+}
+
+// True si la persona ya está al día con el último episodio que animeav1 detectó para este anime Y ese
+// episodio se detectó dentro de la misma semana calendario (lunes a domingo) que ahora. Se usa para
+// tildar el check de "lo vio la semana que salió" en la sheet: ponerse al día con capítulos viejos
+// (semanas atrás, vía /recarga o /capitulo) no cuenta, solo estar al día en tiempo real. El reset
+// semanal del check en sí lo hace un script aparte de la sheet, los domingos; esto solo decide cuándo
+// tildarlo, nunca lo destilda.
+function isCaughtUpThisWeek({ seasonLabel, malId, guildId, episodesWatched }) {
+	const { episode, detectedAt } = readAv1Entry(av1NotifiedKey(malId, seasonLabel, guildId));
+	if (!episode || !detectedAt) return false;
+	if (episodesWatched < episode) return false;
+	return startOfCalendarWeek(detectedAt) === startOfCalendarWeek(Date.now());
 }
 
 // Ventana horaria del aviso de "hoy sale capítulo" para un guild (ver DEFAULT_NOTIFY_WINDOW). Guardado
@@ -232,6 +307,17 @@ function getVoteRole(guildId) {
 
 function setVoteRole({ guildId, roleId }) {
 	store.voteRoles[guildId] = roleId;
+	save();
+}
+
+// Si /link-fix está activado para este guild (desactivado por defecto: hay que optar explícitamente,
+// porque implica que el bot borre mensajes ajenos).
+function getLinkFixEnabled(guildId) {
+	return store.linkFixEnabled[guildId] ?? false;
+}
+
+function setLinkFixEnabled(guildId, enabled) {
+	store.linkFixEnabled[guildId] = enabled;
 	save();
 }
 
@@ -257,6 +343,52 @@ function getAv1ForumThread({ guildId, seasonLabel, malId }) {
 	return store.av1ForumThreads[av1ThreadKey({ guildId, seasonLabel, malId })] ?? null;
 }
 
+function episodeLinkMessageKey({ guildId, seasonLabel, malId, episode }) {
+	return `${guildId}::${seasonLabel}::${malId}::${episode}`;
+}
+
+// Recuerda el mensaje del hilo de foro donde se publicaron los links de descarga de un capítulo
+// puntual (con qué proveedores ya se incluyeron), para poder revisarlo unos días después y agregar los
+// que aparezcan más tarde (Mega/torrent suelen tardar más que 1Fichier/MP4Upload en subirse).
+function recordEpisodeLinkMessage({ guildId, seasonLabel, malId, episode, title, slug, threadId, messageId, providers, hasErai }) {
+	const key = episodeLinkMessageKey({ guildId, seasonLabel, malId, episode });
+	store.episodeLinkMessages[key] = { guildId, seasonLabel, malId, episode, title, slug, threadId, messageId, providers, hasErai, postedAt: Date.now() };
+	save();
+}
+
+// Actualiza los proveedores ya vistos de una entrada existente sin tocar postedAt (la ventana de
+// rechequeo se cuenta desde la publicación original, no desde la última vez que se encontró algo
+// nuevo). No hace nada si la entrada ya no existe (p. ej. se borró por encontrar todo o por vencerse).
+function updateEpisodeLinkMessageProviders({ guildId, seasonLabel, malId, episode, providers, hasErai }) {
+	const key = episodeLinkMessageKey({ guildId, seasonLabel, malId, episode });
+	const existing = store.episodeLinkMessages[key];
+	if (!existing) return;
+	store.episodeLinkMessages[key] = { ...existing, providers, hasErai };
+	save();
+}
+
+function deleteEpisodeLinkMessage({ guildId, seasonLabel, malId, episode }) {
+	delete store.episodeLinkMessages[episodeLinkMessageKey({ guildId, seasonLabel, malId, episode })];
+	save();
+}
+
+// Devuelve las entradas todavía dentro de la ventana de rechequeo (no más viejas que maxAgeMs), podando
+// de paso las que ya se pasaron: no tiene sentido seguir revisando capítulos de hace semanas para
+// siempre.
+function collectDueEpisodeLinkChecks(maxAgeMs) {
+	const now = Date.now();
+	const due = [];
+	for (const [key, entry] of Object.entries(store.episodeLinkMessages)) {
+		if (now - entry.postedAt > maxAgeMs) {
+			delete store.episodeLinkMessages[key];
+		} else {
+			due.push(entry);
+		}
+	}
+	save();
+	return due;
+}
+
 module.exports = {
 
 	upsertAnime,
@@ -269,22 +401,30 @@ module.exports = {
 	addEpisodesWatched,
 	setEpisodesWatched,
 	getEpisodesWatched,
-	getProgressForAnime,
+	getWatchersWithProgress,
 	setNotificationChannel,
 	getNotificationChannel,
 	getLastNotifiedAv1Episode,
 	setLastNotifiedAv1Episode,
+	isCaughtUpThisWeek,
 	getNotifyWindow,
 	setNotifyWindow,
 	getVoteRole,
 	setVoteRole,
+	getLinkFixEnabled,
+	setLinkFixEnabled,
 	getForumChannel,
 	setForumChannel,
 	getAv1ForumThread,
 	setAv1ForumThread,
+	recordEpisodeLinkMessage,
+	updateEpisodeLinkMessageProviders,
+	deleteEpisodeLinkMessage,
+	collectDueEpisodeLinkChecks,
 	getAnimeForSeason,
 
 	getAllAnime,
+	getAnimeAcrossGuilds,
 	getVotesForSeason,
 	setActiveSeason,
 	getActiveSeason,

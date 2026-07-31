@@ -10,6 +10,8 @@ const {
 	getWatchers,
 } = require('../services/db');
 const { getDownloadLinks, findSlugByTitle } = require('../services/animeav1');
+const { findEraiMagnet } = require('../services/nyaa');
+const { autoCleanupReply } = require('../ephemeral');
 
 function withTimeout(ms, promise, errMsg) {
 	return new Promise((resolve, reject) => {
@@ -26,12 +28,15 @@ function withTimeout(ms, promise, errMsg) {
 	});
 }
 
-// Busca el último episodio disponible para un anime consultando la página del episodio
-// y avanzando hasta que falle.
-async function findLastEpisodeNumber(slug, maxTries = 150) {
-	let ep = 1;
+// Busca el último episodio disponible para un anime consultando la página del episodio y avanzando
+// hasta que falle. Arranca en `startEpisode` (no siempre en 1): para series con cientos/miles de
+// episodios (ej. One Piece) animeav1 ya no tiene los primeros, así que probar desde el 1 siempre
+// fallaría de entrada; arrancar desde el último que la gente ya tiene marcado evita eso.
+async function findLastEpisodeNumber(slug, startEpisode = 1, maxTries = 150) {
+	let ep = startEpisode;
 	let lastOk = 0;
-	while (ep <= maxTries) {
+	const limit = startEpisode + maxTries - 1;
+	while (ep <= limit) {
 		try {
 			await withTimeout(12_000, getDownloadLinks(slug, ep), `timeout getDownloadLinks ${ep}`);
 			lastOk = ep;
@@ -44,7 +49,14 @@ async function findLastEpisodeNumber(slug, maxTries = 150) {
 }
 
 
-function formatEpisodeMessage(episode, dl) {
+// Un bot no puede escribir en el portapapeles del usuario (no existe esa API en Discord); lo más
+// cercano es un bloque de código, que en el cliente de Discord muestra su propio ícono de copiar al
+// pasar el mouse por arriba. Se usa para cada link/magnet individual en vez de como texto plano.
+function codeBlock(text) {
+	return `\`\`\`${text}\`\`\``;
+}
+
+function formatEpisodeMessage(episode, dl, erai) {
 	const lines = [];
 	lines.push(`Episodio **${episode}** — Descargas`);
 	if (dl?.pageUrl) lines.push(`Fuente: ${dl.pageUrl}`);
@@ -52,13 +64,15 @@ function formatEpisodeMessage(episode, dl) {
 		for (const [provider, urls] of dl.providers.entries()) {
 			if (!urls || urls.length === 0) continue;
 			lines.push(`\n**${provider}**`);
-			for (const u of urls) lines.push(`- ${u}`);
+			for (const u of urls) lines.push(codeBlock(u));
 		}
+	}
+	if (erai) {
+		lines.push(`\n**Erai-raws (1080p)**`);
+		lines.push(codeBlock(erai.magnet));
 	}
 	return lines.filter(Boolean).join('\n');
 }
-
-const ONE_PIECE_MATCH = /one\s*piece/i;
 
 // Borra todos los mensajes de un hilo de foro EXCEPTO el primero (el post inicial con el embed y los
 // botones de voto, que comparte id con el propio hilo). Se usa con "forzar" para que republicar no
@@ -80,7 +94,7 @@ async function clearThreadReplies(thread) {
 
 const data = new SlashCommandBuilder()
 	.setName('recarga')
-	.setDescription('Recarga capítulos viejos desde animeav1 al foro (excepto One Piece)')
+	.setDescription('Recarga capítulos viejos desde animeav1 al foro')
 	.addBooleanOption((option) =>
 		option
 			.setName('forzar')
@@ -105,6 +119,7 @@ async function execute(interaction) {
 		tracked = getAllAnime().filter((a) => a.guildId === interaction.guildId);
 		if (tracked.length === 0) {
 			await interaction.editReply('No hay animes registrados para este servidor.');
+			autoCleanupReply(interaction);
 			return;
 		}
 	}
@@ -115,7 +130,7 @@ async function execute(interaction) {
 
 	for (const anime of tracked) {
 		try {
-			if (!anime?.title || ONE_PIECE_MATCH.test(anime.title)) {
+			if (!anime?.title) {
 				skipped += 1;
 				continue;
 			}
@@ -157,10 +172,10 @@ async function execute(interaction) {
 			}
 
 			const lastNotified = forzar ? 0 : getLastNotifiedAv1Episode({ seasonLabel: anime.seasonLabel, malId: anime.malId, guildId: anime.guildId });
+			const startFrom = Math.max(1, lastNotified + 1);
 			await interaction.editReply(`Procesando **${anime.title}**...`);
 
-			const lastEpisode = await findLastEpisodeNumber(slug);
-			const startFrom = Math.max(1, lastNotified + 1);
+			const lastEpisode = await findLastEpisodeNumber(slug, startFrom);
 			if (!lastEpisode || startFrom > lastEpisode) {
 				// Sin episodios en animeav1 todavía, o ya estábamos al día con el último disponible.
 				skipped += 1;
@@ -170,6 +185,13 @@ async function execute(interaction) {
 			const thread = await interaction.client.channels.fetch(threadId);
 			if (forzar) await clearThreadReplies(thread);
 			for (let ep = startFrom; ep <= lastEpisode; ep += 1) {
+				// Otra corrida de /recarga (o el chequeo automático de cada 30min) puede haber reclamado
+				// este mismo episodio mientras esperábamos; se re-chequea justo antes de reclamarlo.
+				const alreadyClaimed = forzar
+					? false
+					: ep <= getLastNotifiedAv1Episode({ seasonLabel: anime.seasonLabel, malId: anime.malId, guildId: anime.guildId });
+				if (alreadyClaimed) continue;
+
 				let dl;
 				try {
 					dl = await withTimeout(12_000, getDownloadLinks(slug, ep), `timeout getDownloadLinks ${ep}`);
@@ -177,9 +199,16 @@ async function execute(interaction) {
 					// si un episodio puntual falla, seguimos con el resto para no bloquear
 					continue;
 				}
-				const msg = formatEpisodeMessage(ep, dl);
-				await thread.send(msg);
+
+				// Reclama antes de mandar (no después): así una ejecución concurrente que llegue a este
+				// mismo punto ve el reclamo y no vuelve a postear el mismo capítulo.
 				setLastNotifiedAv1Episode({ seasonLabel: anime.seasonLabel, malId: anime.malId, guildId: anime.guildId, episode: ep });
+
+				// El magnet es un extra: si nyaa.one falla o no tiene el release, el mensaje sale igual
+				// solo con lo de animeav1.
+				const erai = await findEraiMagnet(anime.title, ep).catch(() => null);
+				const msg = formatEpisodeMessage(ep, dl, erai);
+				await thread.send(msg);
 				processed += 1;
 			}
 
@@ -189,6 +218,7 @@ async function execute(interaction) {
 	}
 
 	await interaction.editReply(`Listo. Publicados ${processed} episodio(s). Saltados ${skipped}.`);
+	autoCleanupReply(interaction);
 }
 
 module.exports = { data, execute };

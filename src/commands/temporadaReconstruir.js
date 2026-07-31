@@ -1,5 +1,6 @@
 const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
 const { rebuildSeasonTab } = require('../seasonRebuild');
+const { autoCleanupReply } = require('../ephemeral');
 
 const data = new SlashCommandBuilder()
 	.setName('temporada-reconstruir')
@@ -19,13 +20,14 @@ async function execute(interaction) {
 	console.log(`[temporada-reconstruir] reconstruyendo "${nombre}"...`);
 
 	try {
-		const { animeCount, votesApplied } = await rebuildSeasonTab(nombre);
+		const { animeCount, votesApplied } = await rebuildSeasonTab(nombre, interaction.guildId);
 		console.log(`[temporada-reconstruir] "${nombre}" reconstruida: ${animeCount} anime(s), ${votesApplied} voto(s) reaplicados`);
 		await interaction.editReply(`Reconstruí **${nombre}** desde cero: ${animeCount} anime(s) con ${votesApplied} voto(s) reaplicados.`);
 	} catch (err) {
 		console.error(`[temporada-reconstruir] no pude reconstruir "${nombre}":`, err.message);
 		await interaction.editReply(`No pude reconstruir "${nombre}": ${err.message}`);
 	}
+	autoCleanupReply(interaction);
 }
 
 module.exports = { data, execute };

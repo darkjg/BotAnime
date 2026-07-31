@@ -10,11 +10,16 @@ const {
 	getUserVote,
 	addEpisodesWatched,
 	getEpisodesWatched,
-	getProgressForAnime,
+	getWatchersWithProgress,
+	isCaughtUpThisWeek,
+	getAnimeAcrossGuilds,
 } = require('./services/db');
 const { getAnime, rememberAnime, getSeasonLabel } = require('./seasonCache');
 const { handleSeasonSelect, handleSeasonConfirm } = require('./commands/temporadaShared');
+const { handleSelect: handleEnComunSelect, handlePageButton: handleEnComunPageButton } = require('./commands/enComun');
+const { handleSelect: handlePendientesSelect, handleSoloButton: handlePendientesSoloButton } = require('./commands/pendientes');
 const { buildAnimeEmbed, buildVoteRow } = require('./components');
+const { autoCleanupReply } = require('./ephemeral');
 
 // Discord no permite filtrar por rol un UserSelectMenu (solo existe para Role Select), así que el
 // filtro se aplica después de elegir: a "Actualizar capítulo" solo pueden entrar quienes tengan este rol.
@@ -24,6 +29,7 @@ async function handleVoteButton(interaction, voteType, seasonSlug, malId) {
 	const voteRoleId = getVoteRole(interaction.guildId);
 	if (voteRoleId && !interaction.member.roles.cache.has(voteRoleId)) {
 		await interaction.reply({ content: 'No tienes el rol necesario para votar.', ephemeral: true });
+		autoCleanupReply(interaction);
 		return;
 	}
 
@@ -33,6 +39,7 @@ async function handleVoteButton(interaction, voteType, seasonSlug, malId) {
 			content: 'No encuentro este anime en memoria (¿se reinició el bot?). Vuelve a correr /temporada.',
 			ephemeral: true,
 		});
+		autoCleanupReply(interaction);
 		return;
 	}
 
@@ -42,6 +49,7 @@ async function handleVoteButton(interaction, voteType, seasonSlug, malId) {
 			content: 'No encuentro la temporada en memoria (¿se reinició el bot?). Vuelve a correr /temporada.',
 			ephemeral: true,
 		});
+		autoCleanupReply(interaction);
 		return;
 	}
 
@@ -52,7 +60,12 @@ async function handleVoteButton(interaction, voteType, seasonSlug, malId) {
 		voteType === 'rojo' ? anime : { ...anime, isSequel: anime.isSequel || (await hasPrequel(anime.malId)) };
 	if (voteType !== 'rojo') rememberAnime(animeForSheet);
 	const episodesWatched = getEpisodesWatched({ seasonLabel, malId: anime.malId, discordId: interaction.member.id });
-	await setVote(seasonLabel, username, animeForSheet, voteType, episodesWatched);
+	// El voto/progreso es un solo hecho real, no depende del guild desde el que se votó: se escribe en
+	// la sheet de cada guild que tenga este anime registrado (ver getAnimeAcrossGuilds).
+	for (const registro of getAnimeAcrossGuilds({ seasonLabel, malId: anime.malId })) {
+		const caughtUpThisWeek = isCaughtUpThisWeek({ seasonLabel, malId: anime.malId, guildId: registro.guildId, episodesWatched });
+		await setVote(seasonLabel, username, { ...registro, isSequel: animeForSheet.isSequel }, voteType, episodesWatched, caughtUpThisWeek);
+	}
 
 	if (voteType === 'rojo') {
 		removeVote({ seasonLabel, malId: anime.malId, discordId: interaction.member.id });
@@ -72,6 +85,19 @@ async function handleVoteButton(interaction, voteType, seasonSlug, malId) {
 		});
 	}
 
+	// Refresca el embed del propio hilo (color según voteState + quién lo ve y por qué capítulo va) para
+	// que el voto se vea reflejado ahí mismo, no solo en la sheet.
+	const voteState = getVoteState({ seasonLabel, malId: anime.malId });
+	const progress = getWatchersWithProgress({ seasonLabel, malId: anime.malId });
+	try {
+		await interaction.message.edit({
+			embeds: [buildAnimeEmbed(animeForSheet, { voteState, progress })],
+			components: buildVoteRow(seasonLabel, anime.malId, { voteState }),
+		});
+	} catch (err) {
+		console.error(`[interactions] no pude actualizar el embed de "${anime.title}" tras el voto:`, err.message);
+	}
+
 	console.log(`[interactions] voto "${voteType}" de ${username} para "${anime.title}" (${seasonLabel})`);
 
 	const confirmation = voteType === 'rojo' ? `Anotado: no verás **${anime.title}**.` : `Tu voto para **${anime.title}** se guardó.`;
@@ -86,6 +112,7 @@ async function handleUndoVoteButton(interaction, seasonSlug, malId) {
 	const voteRoleId = getVoteRole(interaction.guildId);
 	if (voteRoleId && !interaction.member.roles.cache.has(voteRoleId)) {
 		await interaction.reply({ content: 'No tienes el rol necesario para votar.', ephemeral: true });
+		autoCleanupReply(interaction);
 		return;
 	}
 
@@ -96,14 +123,32 @@ async function handleUndoVoteButton(interaction, seasonSlug, malId) {
 			content: 'No encuentro esto en memoria (¿se reinició el bot?). Vuelve a correr /temporada.',
 			ephemeral: true,
 		});
+		autoCleanupReply(interaction);
 		return;
 	}
 
 	await interaction.deferReply({ ephemeral: true });
 
 	const username = interaction.member.displayName;
-	const cleared = await clearVote(seasonLabel, username, anime);
+	// Igual que al votar: deshacer el voto es un solo hecho real, se limpia en la sheet de cada guild
+	// que tenga este anime registrado.
+	let cleared = false;
+	for (const registro of getAnimeAcrossGuilds({ seasonLabel, malId: anime.malId })) {
+		const clearedAqui = await clearVote(seasonLabel, username, registro);
+		cleared = cleared || clearedAqui;
+	}
 	removeVote({ seasonLabel, malId: anime.malId, discordId: interaction.member.id });
+
+	const voteState = getVoteState({ seasonLabel, malId: anime.malId });
+	const progress = getWatchersWithProgress({ seasonLabel, malId: anime.malId });
+	try {
+		await interaction.message.edit({
+			embeds: [buildAnimeEmbed(anime, { voteState, progress })],
+			components: buildVoteRow(seasonLabel, anime.malId, { voteState }),
+		});
+	} catch (err) {
+		console.error(`[interactions] no pude actualizar el embed de "${anime.title}" tras deshacer el voto:`, err.message);
+	}
 
 	console.log(`[interactions] deshacer voto de ${username} para "${anime.title}" (${seasonLabel}): ${cleared ? 'borrado' : 'no había voto'}`);
 
@@ -126,6 +171,7 @@ async function handleEpisodePickButton(interaction, seasonSlug, malId) {
 	const voteRoleId = getVoteRole(interaction.guildId);
 	if (voteRoleId && !interaction.member.roles.cache.has(voteRoleId)) {
 		await interaction.reply({ content: 'No tienes el rol necesario para votar.', ephemeral: true });
+		autoCleanupReply(interaction);
 		return;
 	}
 
@@ -136,6 +182,7 @@ async function handleEpisodePickButton(interaction, seasonSlug, malId) {
 			content: 'No encuentro esto en memoria (¿se reinició el bot?). Vuelve a correr /temporada.',
 			ephemeral: true,
 		});
+		autoCleanupReply(interaction);
 		return;
 	}
 
@@ -158,6 +205,7 @@ async function handleEpisodePickButton(interaction, seasonSlug, malId) {
 
 	if (eligible.length === 0) {
 		await interaction.reply({ content: 'Nadie en el servidor tiene el rol necesario para actualizar capítulos.', ephemeral: true });
+		autoCleanupReply(interaction);
 		return;
 	}
 
@@ -194,6 +242,7 @@ async function handleEpisodeUsersSelect(interaction, token) {
 	const cached = interaction.client.episodeFlowCache?.get(token);
 	if (!cached) {
 		await interaction.update({ content: 'Esto ya expiró, usa el botón de "Actualizar capítulo" de nuevo.', components: [] });
+		autoCleanupReply(interaction);
 		return;
 	}
 
@@ -212,6 +261,7 @@ async function handleEpisodeUsersSelect(interaction, token) {
 			content: `Ninguno de los elegidos tiene el rol necesario, no se actualizó nada: ${withoutRole.map((u) => `**${u.displayName}**`).join(', ')}.`,
 			components: [],
 		});
+		autoCleanupReply(interaction);
 		return;
 	}
 
@@ -241,6 +291,7 @@ async function handleEpisodeAmountModal(interaction, token) {
 	interaction.client.episodeFlowCache?.delete(token);
 	if (!cached?.users) {
 		await interaction.editReply('Esto ya expiró, usa el botón de "Actualizar capítulo" de nuevo.');
+		autoCleanupReply(interaction);
 		return;
 	}
 
@@ -248,11 +299,15 @@ async function handleEpisodeAmountModal(interaction, token) {
 	const delta = Number(raw);
 	if (!Number.isInteger(delta) || delta === 0) {
 		await interaction.editReply(`"${raw}" no es un número entero válido (probá con 1, -1, 3, etc).`);
+		autoCleanupReply(interaction);
 		return;
 	}
 
 	const { seasonLabel, malId, animeTitle, channelId, messageId, users, withoutRole } = cached;
 	const anime = getAnime(malId);
+	// El voto/progreso es un solo hecho real: se escribe en la sheet de cada guild que tenga este
+	// anime registrado, no solo la de donde se abrió el selector.
+	const registros = getAnimeAcrossGuilds({ seasonLabel, malId });
 	for (const { id, displayName } of users) {
 		const episodesWatched = addEpisodesWatched({ seasonLabel, malId, discordId: id, displayName, delta });
 
@@ -260,10 +315,13 @@ async function handleEpisodeAmountModal(interaction, token) {
 		// capítulo nuevo; si no votó (o votó rojo), no hay celda que actualizar.
 		const vote = getUserVote({ seasonLabel, malId, discordId: id });
 		if (vote && vote.voteType !== 'rojo') {
-			try {
-				await setVote(seasonLabel, displayName, anime, vote.voteType, episodesWatched);
-			} catch (err) {
-				console.error(`[interactions] no pude refrescar la celda de "${displayName}" en la sheet:`, err.message);
+			for (const registro of registros) {
+				const caughtUpThisWeek = isCaughtUpThisWeek({ seasonLabel, malId, guildId: registro.guildId, episodesWatched });
+				try {
+					await setVote(seasonLabel, displayName, registro, vote.voteType, episodesWatched, caughtUpThisWeek);
+				} catch (err) {
+					console.error(`[interactions] no pude refrescar la celda de "${displayName}" en la sheet (guild ${registro.guildId}):`, err.message);
+				}
 			}
 		}
 	}
@@ -273,7 +331,7 @@ async function handleEpisodeAmountModal(interaction, token) {
 	);
 
 	const voteState = getVoteState({ seasonLabel, malId });
-	const progress = getProgressForAnime({ seasonLabel, malId });
+	const progress = getWatchersWithProgress({ seasonLabel, malId });
 
 	try {
 		const channel = await interaction.client.channels.fetch(channelId);
@@ -290,6 +348,7 @@ async function handleEpisodeAmountModal(interaction, token) {
 	const skippedNote =
 		withoutRole?.length > 0 ? ` (sin actualizar por no tener el rol: ${withoutRole.map((u) => `**${u.displayName}**`).join(', ')})` : '';
 	await interaction.editReply(`Listo: ${delta > 0 ? '+' : ''}${delta} capítulo(s) para ${names} en **${animeTitle}**.${skippedNote}`);
+	autoCleanupReply(interaction);
 }
 
 async function handleTrailerButton(interaction, malId) {
@@ -299,11 +358,13 @@ async function handleTrailerButton(interaction, malId) {
 
 	if (trailers.length === 0) {
 		await interaction.editReply(`No hay trailer disponible para **${anime?.title ?? 'este anime'}**.`);
+		autoCleanupReply(interaction);
 		return;
 	}
 
 	if (trailers.length === 1) {
 		await interaction.editReply(`${trailers[0].title}: ${trailers[0].url}`);
+		autoCleanupReply(interaction);
 		return;
 	}
 
@@ -333,10 +394,12 @@ async function handleTrailerSelect(interaction, malId) {
 
 	if (!trailer) {
 		await interaction.update({ content: 'Este selector ya expiró, usa el botón de Trailer de nuevo.', components: [] });
+		autoCleanupReply(interaction);
 		return;
 	}
 
 	await interaction.update({ content: `${trailer.title}: ${trailer.url}`, components: [] });
+	autoCleanupReply(interaction);
 }
 
 async function handleInteraction(interaction) {
@@ -361,6 +424,11 @@ async function handleInteraction(interaction) {
 		} else if (kind === 'seasonconfirm') {
 			const [year, season] = rest;
 			await handleSeasonConfirm(interaction, year, season);
+		} else if (kind === 'pendientessolo') {
+			await handlePendientesSoloButton(interaction);
+		} else if (kind === 'encomunpage') {
+			const [token, pageIndex] = rest;
+			await handleEnComunPageButton(interaction, token, pageIndex);
 		}
 		return;
 	}
@@ -375,6 +443,10 @@ async function handleInteraction(interaction) {
 		} else if (interaction.customId.startsWith('episodeusers:')) {
 			const token = interaction.customId.split(':')[1];
 			await handleEpisodeUsersSelect(interaction, token);
+		} else if (interaction.customId === 'encomun') {
+			await handleEnComunSelect(interaction);
+		} else if (interaction.customId === 'pendientes') {
+			await handlePendientesSelect(interaction);
 		}
 		return;
 	}

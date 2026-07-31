@@ -18,11 +18,21 @@ function sleep(ms) {
 // pestaña entera (sin restos de merges/bordes/huecos de inserciones o reparaciones anteriores) y la
 // vuelve a armar votando "de nuevo" cada voto guardado, en el mismo orden en que ensureAnimeColumn ya
 // sabe ordenar por día de emisión.
-async function rebuildSeasonTab(seasonLabel) {
+async function rebuildSeasonTab(seasonLabel, guildId) {
 	await deleteSeasonTab(seasonLabel);
 	await ensureSeasonTab(seasonLabel);
 
-	const animeByMalId = new Map(getAnimeForSeason(seasonLabel).map((a) => [a.malId, a]));
+	// getAnimeForSeason no filtra por guild: dos guilds pueden compartir la misma etiqueta de
+	// temporada (hoy apuntan a la misma sheet, pero eso podría cambiar) y sin este filtro se
+	// reconstruiría mezclando animes/metadata de ambos. getVotesForSeason tampoco tiene guildId (los
+	// votos no lo guardan), pero al filtrar animeByMalId por guild alcanza: el loop de votos ya
+	// descarta los que no tengan anime en el mapa (`if (!anime) continue`), así que solo se aplican
+	// votos de animes que pertenecen a este guild.
+	const animeByMalId = new Map(
+		getAnimeForSeason(seasonLabel)
+			.filter((a) => a.guildId === guildId)
+			.map((a) => [a.malId, a]),
+	);
 	const votes = getVotesForSeason(seasonLabel);
 
 	// El carryover (CONTINUAN) crea su columna aunque nadie haya votado todavía; el resto de los

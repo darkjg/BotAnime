@@ -87,44 +87,55 @@ function uniqByUrl(items) {
 	return out;
 }
 
-// Intenta extraer links de descarga del episodio desde la página del episodio.
-// Como animeav1 no documenta estructura estable, usamos regex por dominios y capturamos hrefs.
+// Desde un rediseño (Next.js), los links de descarga ya no están en <a href> del HTML: vienen
+// embebidos como JSON dentro de un <script>, en un bloque con forma
+// downloads:{SUB:[{server:"Mega",url:"..."},{server:"MP4Upload",url:"..."}],DUB:[...]}.
+// Solo nos interesa el array SUB.
+const DOWNLOADS_SUB_RE = /downloads:\{SUB:\[(.*?)\]/s;
+const DOWNLOAD_ENTRY_RE = /\{server:"([^"]+)",url:"([^"]+)"\}/g;
+
+// Fallback por si alguna página todavía sirve el formato viejo (<a href="..."><span>SUB</span></a>),
+// para no perder cobertura de golpe si el sitio migra de a poco.
+const LEGACY_LINKS_RE = /<a[^>]*href="([^"]+)"[^>]*>\s*([\s\S]*?)<\/a>/gi;
+
+function legacyProviderFor(href) {
+	const lower = href.toLowerCase();
+	if (lower.includes('mega.nz') || lower.includes('mega.co.nz')) return 'Mega';
+	if (lower.includes('mp4upload.com')) return 'MP4Upload';
+	if (lower.includes('1fichier.com')) return '1Fichier';
+	return null;
+}
+
+// Intenta extraer links de descarga del episodio desde la página del episodio. Como animeav1 no
+// documenta estructura estable (y ya cambió de formato una vez), primero prueba el JSON embebido y,
+// si no encuentra nada, cae al parseo viejo de <a href>.
 async function getDownloadLinks(slug, episode) {
 	const url = `https://animeav1.com/media/${slug}/${episode}`;
 	const res = await fetch(url);
 	if (!res.ok) throw new Error(`animeav1 episodio respondió ${res.status}`);
 	const html = await res.text();
 
-	// Extraemos todos los links de descarga por provider y luego filtramos SOLO los que tienen SUB.
-	// El HTML del sitio no es 100% estable, así que evitamos depender de que el <span> esté
-	// justo como en el ejemplo.
-
-	//
-	// Ejemplo observado en el source:
-	// <a ... href="https://mega.nz/file/..."> ... <span ...>SUB</span> ...</a>
-	const LINKS_RE = /<a[^>]*href="([^"]+)"[^>]*>\s*([\s\S]*?)<\/a>/gi;
 	const links = [];
-	let m;
-	while ((m = LINKS_RE.exec(html))) {
-		const href = m[1];
-		const inner = m[2] ?? '';
-		const lower = href.toLowerCase();
 
-		let provider = null;
-		if (lower.includes('mega.nz') || lower.includes('mega.co.nz')) provider = 'Mega';
-		else if (lower.includes('mp4upload.com')) provider = 'MP4Upload';
-		else if (lower.includes('1fichier.com')) provider = '1ficher';
-		if (!provider) continue;
-
-		// Filtra SUB vs DUB.
-		if (!/\bSUB\b/i.test(inner)) continue;
-
-		const abs = href.startsWith('http') ? href : `https://animeav1.com${href}`;
-		links.push({ provider, url: abs });
+	const subBlock = DOWNLOADS_SUB_RE.exec(html)?.[1];
+	if (subBlock) {
+		let m;
+		DOWNLOAD_ENTRY_RE.lastIndex = 0;
+		while ((m = DOWNLOAD_ENTRY_RE.exec(subBlock))) {
+			links.push({ provider: m[1], url: m[2] });
+		}
 	}
 
-
-
+	if (links.length === 0) {
+		let m;
+		LEGACY_LINKS_RE.lastIndex = 0;
+		while ((m = LEGACY_LINKS_RE.exec(html))) {
+			const provider = legacyProviderFor(m[1]);
+			if (!provider) continue;
+			if (!/\bSUB\b/i.test(m[2] ?? '')) continue;
+			links.push({ provider, url: m[1].startsWith('http') ? m[1] : `https://animeav1.com${m[1]}` });
+		}
+	}
 
 	// Limpiamos duplicados y agrupamos por proveedor, conservando el orden.
 	const dedup = uniqByUrl(links);
