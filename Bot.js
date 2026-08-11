@@ -48,7 +48,18 @@ client.commands.set(linkFix.data.name, linkFix);
 
 
 
+// Si el login se cuelga (ej. arranque en frío del Pi con el reloj todavía sin sincronizar por NTP:
+// las validaciones TLS fallan hasta que se sincroniza) el proceso queda "vivo" pero nunca conectado, y
+// pm2 no lo reinicia solo porque no reinicia procesos que siguen corriendo, solo los que mueren. Este
+// watchdog fuerza la salida si no conectó a tiempo, para que pm2 lo levante de nuevo y reintente.
+const LOGIN_TIMEOUT_MS = 60_000;
+const loginWatchdog = setTimeout(() => {
+	console.error(`[bot] no me conecté a Discord en ${LOGIN_TIMEOUT_MS / 1000}s, reinicio el proceso`);
+	process.exit(1);
+}, LOGIN_TIMEOUT_MS);
+
 client.once('clientReady', () => {
+	clearTimeout(loginWatchdog);
 	console.log(`Conectado como ${client.user.tag}`);
 	startAv1EpisodeNotifier(client);
 });
@@ -94,4 +105,7 @@ client.on('interactionCreate', async (interaction) => {
 	}
 });
 
-client.login(process.env.DISCORD_TOKEN);
+client.login(process.env.DISCORD_TOKEN).catch((err) => {
+	console.error('[bot] client.login falló:', err.message);
+	process.exit(1);
+});

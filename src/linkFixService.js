@@ -130,22 +130,19 @@ async function handleMessage(message) {
 	}
 }
 
-// Reacción 🗑️ sobre un mensaje reenviado por /link-fix: solo el autor original o alguien con
-// "Gestionar mensajes" puede borrarlo así.
+// Reacción 🗑️ sobre un mensaje reenviado por /link-fix: solo el autor original puede borrarlo así
+// (sin excepción para "Gestionar mensajes" — en un server chico ese permiso lo puede tener cualquiera,
+// no solo moderadores, así que no sirve como filtro real).
 async function handleReactionAdd(reaction, reactorUser) {
 	// El propio bot reacciona con esta misma reacción al mandar el mensaje (mensajeEnviado.react(...)
 	// más abajo), y eso también dispara este evento — sin este chequeo, el bot borraría su propio
-	// mensaje al instante (tiene "Gestionar mensajes", así que pasaría el chequeo de más abajo).
+	// mensaje al instante.
 	if (reactorUser.bot) return;
 	if (reaction.emoji.name !== PAPELERA_EMOJI) return;
 
 	const authorId = borrablePorMensaje.get(reaction.message.id);
 	if (!authorId) return;
-
-	if (reactorUser.id !== authorId) {
-		const member = await reaction.message.guild?.members.fetch(reactorUser.id).catch(() => null);
-		if (!member?.permissions.has('ManageMessages')) return;
-	}
+	if (reactorUser.id !== authorId) return;
 
 	borrablePorMensaje.delete(reaction.message.id);
 	await reaction.message.delete().catch(() => {});

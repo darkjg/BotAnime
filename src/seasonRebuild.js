@@ -35,10 +35,15 @@ async function rebuildSeasonTab(seasonLabel, guildId) {
 	);
 	const votes = getVotesForSeason(seasonLabel);
 
-	// El carryover (CONTINUAN) crea su columna aunque nadie haya votado todavía; el resto de los
-	// animes solo tiene columna si alguien votó verde/naranja por ellos.
+	// El carryover (CONTINUAN) crea su columna aunque nadie haya votado todavía; lo mismo un abandonado
+	// (por definición ya no tiene votos verde/naranja que lo recreen abajo, así que sin esto
+	// desaparecería de la sheet en cada reconstrucción). El resto de los animes solo tiene columna si
+	// alguien votó verde/naranja por ellos. El progreso por usuario que tenía la columna de un
+	// abandonado (quién iba por qué capítulo cuando lo dejó) no se puede recuperar acá: esa info solo
+	// vivía en la celda de la sheet, no en la base local (los votos se borran al abandonar), así que se
+	// pierde en una reconstrucción igual que ya pasaba con cualquier voto ya retirado.
 	for (const anime of animeByMalId.values()) {
-		if (!anime.isCarryover) continue;
+		if (!anime.isCarryover && !anime.isAbandoned) continue;
 		await ensureAnimeColumn(seasonLabel, anime);
 		await sleep(THROTTLE_MS);
 	}

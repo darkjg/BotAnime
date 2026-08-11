@@ -1,13 +1,15 @@
 const { ActionRowBuilder, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
 const { getTrailers, hasPrequel } = require('./services/jikan');
-const { setVote, clearVote } = require('./services/sheets');
+const { setVote, clearVote, relocateAnimeColumn } = require('./services/sheets');
 const {
 	recordVote,
 	removeVote,
 	upsertAnime,
+	setAnimeAbandoned,
 	getVoteRole,
 	getVoteState,
 	getUserVote,
+	getWatchers,
 	addEpisodesWatched,
 	getEpisodesWatched,
 	getWatchersWithProgress,
@@ -24,6 +26,29 @@ const { autoCleanupReply } = require('./ephemeral');
 // Discord no permite filtrar por rol un UserSelectMenu (solo existe para Role Select), así que el
 // filtro se aplica después de elegir: a "Actualizar capítulo" solo pueden entrar quienes tengan este rol.
 const EPISODE_UPDATE_ROLE_ID = '1508943288311480370';
+
+// Si tras un voto (o deshacerlo) ya no queda nadie viendo un anime, se marca automáticamente como
+// "abandonado" y se reubica su columna a esa sección de la sheet; si alguien vuelve a votar verde/
+// naranja por algo que estaba marcado así, se desmarca y vuelve a su sección normal (nuevo/secuela/
+// CONTINUAN, según corresponda). malId identifica al anime más allá del guild (ver
+// getAnimeAcrossGuilds), así que basta con reubicarlo una vez: todos los registros de guild comparten
+// la misma columna física en la sheet.
+async function syncAbandonedState(seasonLabel, malId, animeTitle) {
+	const registros = getAnimeAcrossGuilds({ seasonLabel, malId });
+	const wasAbandoned = registros.some((r) => r.isAbandoned);
+	const shouldBeAbandoned = getWatchers({ seasonLabel, malId }).length === 0;
+	if (shouldBeAbandoned === wasAbandoned) return;
+
+	setAnimeAbandoned({ seasonLabel, malId, abandoned: shouldBeAbandoned });
+	const [registro] = getAnimeAcrossGuilds({ seasonLabel, malId });
+	if (!registro) return;
+	try {
+		await relocateAnimeColumn(seasonLabel, registro);
+		console.log(`[interactions] "${animeTitle}" ${shouldBeAbandoned ? 'marcado como abandonado' : 'ya no está abandonado'}, columna reubicada`);
+	} catch (err) {
+		console.error(`[interactions] no pude reubicar "${animeTitle}" (abandonado=${shouldBeAbandoned}):`, err.message);
+	}
+}
 
 async function handleVoteButton(interaction, voteType, seasonSlug, malId) {
 	const voteRoleId = getVoteRole(interaction.guildId);
@@ -85,6 +110,8 @@ async function handleVoteButton(interaction, voteType, seasonSlug, malId) {
 		});
 	}
 
+	await syncAbandonedState(seasonLabel, anime.malId, anime.title);
+
 	// Refresca el embed del propio hilo (color según voteState + quién lo ve y por qué capítulo va) para
 	// que el voto se vea reflejado ahí mismo, no solo en la sheet.
 	const voteState = getVoteState({ seasonLabel, malId: anime.malId });
@@ -138,6 +165,8 @@ async function handleUndoVoteButton(interaction, seasonSlug, malId) {
 		cleared = cleared || clearedAqui;
 	}
 	removeVote({ seasonLabel, malId: anime.malId, discordId: interaction.member.id });
+
+	await syncAbandonedState(seasonLabel, anime.malId, anime.title);
 
 	const voteState = getVoteState({ seasonLabel, malId: anime.malId });
 	const progress = getWatchersWithProgress({ seasonLabel, malId: anime.malId });

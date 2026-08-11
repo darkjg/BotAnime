@@ -3,6 +3,17 @@ const { slugForCustomId } = require('./seasonLabel');
 
 const VOTE_STATE_COLOR = { verde: 0x57f287, naranja: 0xe67e22 };
 
+// "**Nombre**: cap. N" por persona, la más adelantada primero. null si nadie tiene progreso todavía
+// (para no mostrar un título "Progreso" vacío). Se usa tanto en el embed del hilo como en los avisos
+// de capítulo nuevo del scheduler.
+function formatProgressLines(progress) {
+	if (!progress || progress.length === 0) return null;
+	return [...progress]
+		.sort((a, b) => b.episodesWatched - a.episodesWatched)
+		.map((p) => `**${p.displayName}**: cap. ${p.episodesWatched}`)
+		.join('\n');
+}
+
 function buildAnimeEmbed(anime, { voteState, progress } = {}) {
 	const embed = new EmbedBuilder()
 		.setTitle(anime.title)
@@ -21,13 +32,8 @@ function buildAnimeEmbed(anime, { voteState, progress } = {}) {
 		{ name: 'Estudio', value: anime.studios || 'Desconocido', inline: true },
 	);
 
-	if (progress?.length > 0) {
-		const lines = [...progress]
-			.sort((a, b) => b.episodesWatched - a.episodesWatched)
-			.map((p) => `**${p.displayName}**: cap. ${p.episodesWatched}`)
-			.join('\n');
-		embed.addFields({ name: '📺 Progreso', value: lines });
-	}
+	const progressLines = formatProgressLines(progress);
+	if (progressLines) embed.addFields({ name: '📺 Progreso', value: progressLines });
 
 	return embed;
 }
@@ -75,4 +81,4 @@ function buildVoteRow(seasonLabel, malId, { voteState } = {}) {
 	return [voteRow, episodeRow, undoRow];
 }
 
-module.exports = { buildAnimeEmbed, buildVoteRow, buildEpisodeButtonRow };
+module.exports = { buildAnimeEmbed, buildVoteRow, buildEpisodeButtonRow, formatProgressLines };

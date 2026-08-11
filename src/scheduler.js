@@ -13,6 +13,7 @@ const {
 	updateEpisodeLinkMessageProviders,
 	deleteEpisodeLinkMessage,
 	collectDueEpisodeLinkChecks,
+	getWatchersWithProgress,
 } = require('./services/db');
 
 const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
@@ -20,7 +21,7 @@ const { updateAnimeDay, repairSeasonTab } = require('./services/sheets');
 const { getRecentlyUpdatedEpisodes, normalizeTitle, getCoverImage, getDownloadLinks } = require('./services/animeav1');
 const { findEraiMagnet } = require('./services/nyaa');
 
-const { buildEpisodeButtonRow } = require('./components');
+const { buildEpisodeButtonRow, formatProgressLines } = require('./components');
 const { rememberAnime } = require('./seasonCache');
 
 // Un bot no puede escribir en el portapapeles del usuario (no existe esa API en Discord); lo más
@@ -132,7 +133,12 @@ async function checkAndNotifyAv1(client) {
 						if (dl?.providers && dl.providers.size > 0) {
 							const lines = [];
 							lines.push(`Episodio **${av1Entry.episode}** — Descargas`);
-							lines.push(dl.pageUrl ? `Fuente: ${dl.pageUrl}` : '');
+							// <url> en vez de url a secas: evita que Discord genere el embed de vista previa para
+							// este link. Antes, ese embed se intercalaba entre el texto y el botón/Progreso de
+							// abajo (los embeds automáticos siempre se renderizan después de todo el texto, pero
+							// antes de los componentes), quedando "Progreso" separado del botón por un cartel
+							// grande sin relación.
+							lines.push(dl.pageUrl ? `Fuente: <${dl.pageUrl}>` : '');
 							for (const [provider, urls] of dl.providers.entries()) {
 								if (!urls || urls.length === 0) continue;
 								lines.push(`\n**${provider}**`);
@@ -147,8 +153,22 @@ async function checkAndNotifyAv1(client) {
 								lines.push(codeBlock(erai.magnet));
 							}
 
+							// Quién lo está viendo y por qué capítulo va, justo arriba del botón para actualizar
+							// el propio: así no hay que ir a buscar el post inicial del hilo para saber si hay
+							// que ponerse al día.
+							const progressLines = formatProgressLines(
+								getWatchersWithProgress({ seasonLabel: entry.seasonLabel, malId: entry.malId }),
+							);
+							if (progressLines) {
+								lines.push(`\n📺 Progreso`);
+								lines.push(progressLines);
+							}
+
 							const msg = lines.filter(Boolean).join('\n');
-							const threadMessage = await thread.send(msg);
+							const threadMessage = await thread.send({
+								content: msg,
+								components: [buildEpisodeButtonRow(entry.seasonLabel, entry.malId)],
+							});
 							threadMessageUrl = `https://discord.com/channels/${entry.guildId}/${forumThreadId}/${threadMessage.id}`;
 							console.log(`[scheduler] publicado en foro para "${entry.title}" ep. ${av1Entry.episode}`);
 

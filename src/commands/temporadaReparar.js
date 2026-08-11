@@ -25,6 +25,13 @@ function summarizeBlock(label, result) {
 	return `**${label}**: ${parts.join(', ')}`;
 }
 
+function summarizeCrossBlock(result) {
+	if (!result || result.fixed === 0) return null;
+	const base = `**Duplicados entre bloques**: ${result.fixed} anime(s) que estaban repetidos en más de un bloque (nuevo/secuela/CONTINUAN), arreglado.`;
+	if (result.warnings.length === 0) return base;
+	return `${base}\n⚠️ ${result.warnings.join('\n⚠️ ')}`;
+}
+
 async function execute(interaction) {
 	await interaction.deferReply({ ephemeral: true });
 
@@ -33,9 +40,13 @@ async function execute(interaction) {
 
 	try {
 		const report = await repairSeasonTab(nombre);
-		const lines = [summarizeBlock('Nuevo', report.nuevo), summarizeBlock('Secuela', report.secuela), summarizeBlock('CONTINUAN', report.continuan)].filter(
-			Boolean,
-		);
+		const lines = [
+			summarizeCrossBlock(report.crossBlock),
+			summarizeBlock('Nuevo', report.nuevo),
+			summarizeBlock('Secuela', report.secuela),
+			summarizeBlock('CONTINUAN', report.continuan),
+			summarizeBlock('ABANDONADOS', report.abandonados),
+		].filter(Boolean);
 
 		console.log(`[temporada-reparar] "${nombre}" reparada: ${lines.join(' | ') || 'sin cambios'}`);
 		await interaction.editReply(

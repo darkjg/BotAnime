@@ -19,6 +19,7 @@ const DAY_LABEL = 'Día de emisión';
 const NAME_LABEL = 'Nombre';
 const CONTINUACION_LABEL = '2/3/4/5 TEMPORADAS';
 const SIGUEN_LABEL = 'CONTINUAN';
+const ABANDONADOS_LABEL = 'ABANDONADOS';
 const BLACK = { red: 0, green: 0, blue: 0 };
 const THIN_BLACK_BORDER = { style: 'SOLID', width: 1, color: BLACK };
 const THICK_BLACK_BORDER = { style: 'SOLID_THICK', width: 3, color: BLACK };
@@ -222,6 +223,62 @@ async function resolveContinuacionLayout(sheets, title) {
 	return { ...layout, dayRowIndex: continuacion.dayRowIndex };
 }
 
+// Bloque "ABANDONADOS": encadenado siempre después de "continuación" (nunca directo después de
+// "nuevo"), para que su posición no dependa de si secuela/CONTINUAN ya existían o no. Si no hay
+// bloque "continuación" todavía, tampoco puede haber "ABANDONADOS" (peekAbandonadosLayout devuelve
+// exists:false); resolveAbandonadosLayout es quien fuerza a crear "continuación" primero si hace
+// falta, así el punto de anclaje queda fijo y ambos bloques no compiten por el mismo lugar.
+async function peekAbandonadosLayout(sheets, title) {
+	const continuacionLayout = await peekContinuacionLayout(sheets, title);
+	if (!continuacionLayout.exists) return { exists: false };
+
+	const continuacion = await getUsersAndDayRow(sheets, title, continuacionLayout.userStart);
+	const anchorDayRow = continuacion.dayRowIndex;
+	const defaultLabelRow = anchorDayRow + BLANK_ROWS_BETWEEN_BLOCKS + 1;
+
+	const searchStart = anchorDayRow + 1;
+	const searchEnd = defaultLabelRow + 3;
+	const res = await sheets.spreadsheets.values.get({
+		spreadsheetId: SPREADSHEET_ID,
+		range: `'${title}'!${columnLetter(NAME_COL_INDEX)}${searchStart}:${columnLetter(NAME_COL_INDEX)}${searchEnd}`,
+	});
+	const values = res.data.values ?? [];
+	const offset = values.findIndex((row) => (row[0] ?? '') !== '');
+	const labelRow = offset === -1 ? defaultLabelRow : searchStart + offset;
+
+	const imageRow = labelRow + 1;
+	const titleRow = imageRow + IMAGE_ROW_SPAN;
+	const userStart = titleRow + 1;
+
+	const headerCheck = await sheets.spreadsheets.values.get({
+		spreadsheetId: SPREADSHEET_ID,
+		range: `'${title}'!A${titleRow}`,
+	});
+	return { labelRow, imageRow, titleRow, userStart, exists: Boolean(headerCheck.data.values) };
+}
+
+async function resolveAbandonadosLayout(sheets, title) {
+	await resolveContinuacionLayout(sheets, title);
+	const layout = await peekAbandonadosLayout(sheets, title);
+
+	if (!layout.exists) {
+		await sheets.spreadsheets.values.batchUpdate({
+			spreadsheetId: SPREADSHEET_ID,
+			requestBody: {
+				valueInputOption: 'RAW',
+				data: [
+					{ range: `'${title}'!A${layout.labelRow}`, values: [[ABANDONADOS_LABEL]] },
+					{ range: `'${title}'!A${layout.titleRow}`, values: [[NAME_LABEL]] },
+					{ range: `'${title}'!A${layout.userStart}`, values: [[DAY_LABEL]] },
+				],
+			},
+		});
+	}
+
+	const abandonados = await getUsersAndDayRow(sheets, title, layout.userStart);
+	return { ...layout, dayRowIndex: abandonados.dayRowIndex };
+}
+
 async function ensureColumnCapacity(sheets, sheet, targetCol) {
 	const needed = targetCol + 2;
 	if (needed > sheet.properties.gridProperties.columnCount) {
@@ -353,18 +410,41 @@ async function applyContinuacionOuterBorder(sheets, sheet, title, layout) {
 	const endColumnIndex = siguenStartCol + count * 2;
 
 	const requests = [];
-	// Limpia cualquier borde grueso que haya quedado mal aplicado más allá del bloque real (de corridas
-	// anteriores con el cálculo viejo), para que no reaparezca solo aunque se borre a mano.
-	const gridEnd = sheet.properties.gridProperties.columnCount;
-	if (gridEnd > endColumnIndex) {
+	// Limpia cualquier borde grueso que haya quedado mal aplicado más allá del bloque real — a la
+	// derecha (más columnas de las que hay animes) o hacia abajo (más filas que las del propio bloque,
+	// el bug de "bordes infinitos hacia abajo") — de corridas anteriores con el cálculo viejo, para que
+	// no reaparezca solo aunque se borre a mano.
+	const gridColEnd = sheet.properties.gridProperties.columnCount;
+	const gridRowEnd = sheet.properties.gridProperties.rowCount;
+	const NO_BORDER = { style: 'NONE' };
+	if (gridColEnd > endColumnIndex) {
 		requests.push({
 			updateBorders: {
-				range: { sheetId, startRowIndex: layout.labelRow - 1, endRowIndex: layout.dayRowIndex, startColumnIndex: endColumnIndex, endColumnIndex: gridEnd },
-				top: { style: 'NONE' },
-				bottom: { style: 'NONE' },
-				left: { style: 'NONE' },
-				right: { style: 'NONE' },
-				innerVertical: { style: 'NONE' },
+				range: { sheetId, startRowIndex: layout.labelRow - 1, endRowIndex: layout.dayRowIndex, startColumnIndex: endColumnIndex, endColumnIndex: gridColEnd },
+				top: NO_BORDER,
+				bottom: NO_BORDER,
+				left: NO_BORDER,
+				right: NO_BORDER,
+				innerVertical: NO_BORDER,
+			},
+		});
+	}
+	if (gridRowEnd > layout.dayRowIndex) {
+		requests.push({
+			updateBorders: {
+				range: {
+					sheetId,
+					startRowIndex: layout.dayRowIndex,
+					endRowIndex: gridRowEnd,
+					startColumnIndex: siguenStartCol,
+					endColumnIndex: Math.max(endColumnIndex, gridColEnd),
+				},
+				top: NO_BORDER,
+				bottom: NO_BORDER,
+				left: NO_BORDER,
+				right: NO_BORDER,
+				innerVertical: NO_BORDER,
+				innerHorizontal: NO_BORDER,
 			},
 		});
 	}
@@ -592,6 +672,18 @@ async function repairContinuacionBlocks(sheets, sheetId, title) {
 	}
 }
 
+// Repara "ABANDONADOS" tras una inserción hecha por otro bloque: comparte el mismo eje de columnas
+// (todos los bloques empiezan en la columna B, cada uno en sus propias filas), así que insertar
+// columnas en nuevo/secuela/CONTINUAN para mantener el orden por día también corre las columnas de
+// ABANDONADOS que caigan a partir de ese punto, dejando un hueco lógico igual que en los otros bloques.
+async function repairAbandonadosBlock(sheets, sheetId, title) {
+	const layout = await peekAbandonadosLayout(sheets, title);
+	if (!layout.exists) return;
+
+	const { dayRowIndex } = await getUsersAndDayRow(sheets, title, layout.userStart);
+	await closeGapInBlock(sheets, sheetId, title, layout.imageRow, dayRowIndex, layout.titleRow, FIRST_ANIME_COL_INDEX);
+}
+
 // Vacía por completo la columna de voto de un anime (imagen, título, día, usuarios, validación),
 // dejándola como un hueco para que closeGapInBlock la absorba. Se usa para borrar columnas
 // duplicadas detectadas por repairBlock.
@@ -737,16 +829,113 @@ async function repairBlock(sheets, sheet, title, rowStart, titleRow, startCol, d
 	return { fixedDuplicates, fixedGaps, reordered };
 }
 
-// Repara una pestaña entera: nuevo, secuela y CONTINUAN, en ese orden. Si borrar duplicados encogió
-// a "secuela", recoloca "CONTINUAN" (etiqueta incluida) pegado a su nuevo final antes de repararlo,
-// porque comparten fila y "CONTINUAN" no se mueve solo cuando secuela se encoge.
+// Detecta el mismo anime (malId) repetido en más de un bloque/subgrupo (nuevo/secuela/CONTINUAN/ABANDONADOS):
+// puede pasar si isSequel/isCarryover se resolvió distinto en votos separados (antes de que ese valor
+// quedara "pegajoso" en la base, ver upsertAnime en db.js), o por una carrera al crear la columna. Se
+// queda con la ocurrencia que tenga más celdas de usuario con contenido (la más "viva") y borra las
+// demás. No intenta fusionar datos entre ocurrencias: las listas de usuarios pueden no coincidir fila
+// a fila entre bloques (cada uno agrega gente en el orden en que fue votando ahí), así que mezclar a
+// ciegas por posición de fila podría pisar el valor de una persona con el de otra. Si la ocurrencia
+// borrada tenía datos que la conservada no tiene, se devuelve en `warnings` para revisar a mano — se
+// vuelve a escribir sola la próxima vez que esa persona vote o actualice su capítulo.
+async function repairCrossBlockDuplicates(sheets, sheet, seasonName) {
+	const sheetId = sheet.properties.sheetId;
+	const occurrences = [];
+
+	const nuevoUsers = await getUsersAndDayRow(sheets, seasonName, NUEVO_USER_START);
+	const nuevoImageRow = NUEVO_TITLE_ROW - IMAGE_ROW_SPAN;
+	const nuevoMalIds = await getMalIdsInRange(sheets, seasonName, NUEVO_TITLE_ROW, FIRST_ANIME_COL_INDEX);
+	nuevoMalIds.forEach((malId, i) => {
+		if (!malId) return;
+		occurrences.push({ malId, col: FIRST_ANIME_COL_INDEX + i * 2, rowStart: nuevoImageRow, userStart: NUEVO_USER_START, dayRowIndex: nuevoUsers.dayRowIndex });
+	});
+
+	const layout = await peekContinuacionLayout(sheets, seasonName);
+	if (layout.exists) {
+		const continuacion = await getUsersAndDayRow(sheets, seasonName, layout.userStart);
+		const continuacionMalIds = await getMalIdsInRange(sheets, seasonName, layout.titleRow, FIRST_ANIME_COL_INDEX);
+		continuacionMalIds.forEach((malId, i) => {
+			if (!malId) return;
+			occurrences.push({
+				malId,
+				col: FIRST_ANIME_COL_INDEX + i * 2,
+				rowStart: layout.imageRow,
+				userStart: layout.userStart,
+				dayRowIndex: continuacion.dayRowIndex,
+			});
+		});
+
+		const abandonadosLayout = await peekAbandonadosLayout(sheets, seasonName);
+		if (abandonadosLayout.exists) {
+			const abandonados = await getUsersAndDayRow(sheets, seasonName, abandonadosLayout.userStart);
+			const abandonadosMalIds = await getMalIdsInRange(sheets, seasonName, abandonadosLayout.titleRow, FIRST_ANIME_COL_INDEX);
+			abandonadosMalIds.forEach((malId, i) => {
+				if (!malId) return;
+				occurrences.push({
+					malId,
+					col: FIRST_ANIME_COL_INDEX + i * 2,
+					rowStart: abandonadosLayout.imageRow,
+					userStart: abandonadosLayout.userStart,
+					dayRowIndex: abandonados.dayRowIndex,
+				});
+			});
+		}
+	}
+
+	const byMalId = new Map();
+	for (const occ of occurrences) {
+		if (!byMalId.has(occ.malId)) byMalId.set(occ.malId, []);
+		byMalId.get(occ.malId).push(occ);
+	}
+
+	let fixed = 0;
+	const warnings = [];
+
+	for (const [malId, occs] of byMalId) {
+		if (occs.length <= 1) continue;
+
+		const reads = await Promise.all(
+			occs.map((occ) =>
+				sheets.spreadsheets.values.get({
+					spreadsheetId: SPREADSHEET_ID,
+					range: `'${seasonName}'!${columnLetter(occ.col)}${occ.userStart}:${columnLetter(occ.col)}${occ.dayRowIndex - 1}`,
+				}),
+			),
+		);
+		const valuesPerOcc = reads.map((r) => (r.data.values ?? []).map((row) => (row[0] ?? '').toString()));
+		const countsPerOcc = valuesPerOcc.map((vals) => vals.filter((v) => v !== '').length);
+
+		let keepIndex = 0;
+		for (let i = 1; i < occs.length; i += 1) {
+			if (countsPerOcc[i] > countsPerOcc[keepIndex]) keepIndex = i;
+		}
+
+		const loseIndexes = occs.map((_, i) => i).filter((i) => i !== keepIndex);
+		if (loseIndexes.some((i) => countsPerOcc[i] > 0)) {
+			warnings.push(`malId ${malId}: se conservó la columna con ${countsPerOcc[keepIndex]} valor(es) de usuario; se borró otra ocurrencia que también tenía datos.`);
+		}
+
+		for (const i of loseIndexes) {
+			await clearBlockColumn(sheets, sheetId, occs[i].rowStart, occs[i].dayRowIndex, occs[i].col);
+		}
+		fixed += 1;
+	}
+
+	return { fixed, warnings };
+}
+
+// Repara una pestaña entera: primero duplicados entre bloques, después nuevo, secuela y CONTINUAN
+// (cada uno con su propio dedup/huecos/orden). Si borrar duplicados encogió a "secuela", recoloca
+// "CONTINUAN" (etiqueta incluida) pegado a su nuevo final antes de repararlo, porque comparten fila y
+// "CONTINUAN" no se mueve solo cuando secuela se encoge.
 async function repairSeasonTabImpl(seasonName) {
 	const sheets = await getSheetsClient();
 	const sheet = await findSheetByTitle(sheets, seasonName);
 	if (!sheet) throw new Error(`No existe la pestaña de temporada: ${seasonName}`);
 	const sheetId = sheet.properties.sheetId;
 
-	const report = { nuevo: null, secuela: null, continuan: null };
+	const crossBlock = await repairCrossBlockDuplicates(sheets, sheet, seasonName);
+	const report = { crossBlock, nuevo: null, secuela: null, continuan: null, abandonados: null };
 
 	const nuevoUsers = await getUsersAndDayRow(sheets, seasonName, NUEVO_USER_START);
 	const nuevoImageRow = NUEVO_TITLE_ROW - IMAGE_ROW_SPAN;
@@ -786,7 +975,25 @@ async function repairSeasonTabImpl(seasonName) {
 			);
 		}
 
-		await applyContinuacionOuterBorder(sheets, sheet, seasonName, layout);
+		// layout (de peekContinuacionLayout) no trae dayRowIndex; sin él, applyContinuacionOuterBorder
+		// deja endRowIndex sin especificar y la API de Sheets trata eso como "sin límite" — el borde
+		// grueso queda infinito hacia abajo cada vez que se repara. Se completa acá con el dayRowIndex
+		// ya calculado arriba.
+		await applyContinuacionOuterBorder(sheets, sheet, seasonName, { ...layout, dayRowIndex: continuacion.dayRowIndex });
+	}
+
+	const abandonadosLayout = await peekAbandonadosLayout(sheets, seasonName);
+	if (abandonadosLayout.exists) {
+		const abandonados = await getUsersAndDayRow(sheets, seasonName, abandonadosLayout.userStart);
+		report.abandonados = await repairBlock(
+			sheets,
+			sheet,
+			seasonName,
+			abandonadosLayout.imageRow,
+			abandonadosLayout.titleRow,
+			FIRST_ANIME_COL_INDEX,
+			abandonados.dayRowIndex,
+		);
 	}
 
 	invalidateColumnCache(seasonName);
@@ -800,6 +1007,23 @@ async function ensureAnimeColumnImpl(seasonName, anime) {
 	const sheets = await getSheetsClient();
 	const sheet = await findSheetByTitle(sheets, seasonName);
 	if (!sheet) throw new Error(`No existe la pestaña de temporada: ${seasonName}`);
+
+	// "Abandonado" manda sobre isSequel/isCarryover: aunque el anime sea una secuela, si ya nadie lo
+	// sigue va a la sección ABANDONADOS, no a la suya normal (ver relocateAnimeColumn, que es quien
+	// mueve la columna de un bloque a otro cuando esta bandera cambia). Siempre agrega al final del
+	// bloque, sin ordenar por día: el orden de emisión no importa para algo que nadie está viendo.
+	if (anime.isAbandoned) {
+		const layout = await resolveAbandonadosLayout(sheets, seasonName);
+		const malIds = await getMalIdsInRange(sheets, seasonName, layout.titleRow, FIRST_ANIME_COL_INDEX);
+		const existingIndex = malIds.indexOf(anime.malId);
+		if (existingIndex !== -1) return { animeIndex: FIRST_ANIME_COL_INDEX + existingIndex * 2, userStart: layout.userStart };
+
+		const targetCol = FIRST_ANIME_COL_INDEX + malIds.length * 2;
+		await ensureColumnCapacity(sheets, sheet, targetCol);
+		await writeAnimeBlock(sheets, sheet.properties.sheetId, seasonName, anime, targetCol, layout.imageRow, layout.titleRow, layout.dayRowIndex);
+		invalidateColumnCache(seasonName);
+		return { animeIndex: targetCol, userStart: layout.userStart };
+	}
 
 	if (!anime.isSequel && !anime.isCarryover) {
 		const [malIds, { dayRowIndex }] = await Promise.all([
@@ -820,6 +1044,7 @@ async function ensureAnimeColumnImpl(seasonName, anime) {
 		if (insertBefore) {
 			await insertColumnsAt(sheets, sheet.properties.sheetId, targetCol);
 			await repairContinuacionBlocks(sheets, sheet.properties.sheetId, seasonName);
+			await repairAbandonadosBlock(sheets, sheet.properties.sheetId, seasonName);
 		}
 		await ensureColumnCapacity(sheets, sheet, targetCol);
 		const imageRow = NUEVO_TITLE_ROW - IMAGE_ROW_SPAN;
@@ -850,10 +1075,12 @@ async function ensureAnimeColumnImpl(seasonName, anime) {
 		if (insertBefore) {
 			await insertColumnsAt(sheets, sheet.properties.sheetId, targetCol);
 			await repairNuevoBlock(sheets, sheet.properties.sheetId, seasonName);
+			await repairAbandonadosBlock(sheets, sheet.properties.sheetId, seasonName);
 		} else if (siguenStartCol !== null && targetCol >= siguenStartCol) {
 			// Appendeando al final del subgrupo secuela, pero eso pisaría el inicio de "siguen": lo corremos.
 			await insertColumnsAt(sheets, sheet.properties.sheetId, siguenStartCol);
 			await repairNuevoBlock(sheets, sheet.properties.sheetId, seasonName);
+			await repairAbandonadosBlock(sheets, sheet.properties.sheetId, seasonName);
 		}
 		await ensureColumnCapacity(sheets, sheet, targetCol);
 		await writeAnimeBlock(sheets, sheet.properties.sheetId, seasonName, anime, targetCol, layout.imageRow, layout.titleRow, layout.dayRowIndex);
@@ -890,6 +1117,7 @@ async function ensureAnimeColumnImpl(seasonName, anime) {
 	if (insertBefore) {
 		await insertColumnsAt(sheets, sheet.properties.sheetId, targetCol);
 		await repairNuevoBlock(sheets, sheet.properties.sheetId, seasonName);
+		await repairAbandonadosBlock(sheets, sheet.properties.sheetId, seasonName);
 	}
 	await ensureColumnCapacity(sheets, sheet, targetCol);
 	await writeAnimeBlock(sheets, sheet.properties.sheetId, seasonName, anime, targetCol, layout.imageRow, layout.titleRow, layout.dayRowIndex);
@@ -1036,9 +1264,16 @@ async function locateAnimeColumn(sheets, seasonName, anime) {
 	const secuelaIndex = continuacionMalIds.slice(0, splitIndex).indexOf(anime.malId);
 	if (secuelaIndex !== -1) return { col: FIRST_ANIME_COL_INDEX + secuelaIndex * 2, userStart: layout.userStart };
 
-	if (siguenStartCol === null) return null;
-	const siguenIndex = continuacionMalIds.slice(splitIndex).indexOf(anime.malId);
-	return siguenIndex === -1 ? null : { col: siguenStartCol + siguenIndex * 2, userStart: layout.userStart };
+	if (siguenStartCol !== null) {
+		const siguenIndex = continuacionMalIds.slice(splitIndex).indexOf(anime.malId);
+		if (siguenIndex !== -1) return { col: siguenStartCol + siguenIndex * 2, userStart: layout.userStart };
+	}
+
+	const abandonadosLayout = await peekAbandonadosLayout(sheets, seasonName);
+	if (!abandonadosLayout.exists) return null;
+	const abandonadosMalIds = await getMalIdsInRange(sheets, seasonName, abandonadosLayout.titleRow, FIRST_ANIME_COL_INDEX);
+	const abandonadosIndex = abandonadosMalIds.indexOf(anime.malId);
+	return abandonadosIndex === -1 ? null : { col: FIRST_ANIME_COL_INDEX + abandonadosIndex * 2, userStart: abandonadosLayout.userStart };
 }
 
 // Corrige el día de emisión ya escrito en la celda de un anime existente, sin mover su columna:
@@ -1122,6 +1357,179 @@ async function clearVoteImpl(seasonName, username, anime) {
 	return true;
 }
 
+// Ubica en qué bloque/subgrupo está HOY la columna de un anime (si tiene alguna), junto con los
+// límites de columna de ese bloque (startCol/endColBound) que closeGapInBlock necesita para cerrar el
+// hueco que deja al borrarla. A diferencia de locateAnimeColumn (que solo da col+userStart), esto
+// también dice el nombre del bloque, para compararlo contra dónde debería estar según sus banderas
+// actuales — lo usa relocateAnimeColumn.
+async function locateAnimeBlockOccurrence(sheets, seasonName, malId) {
+	const nuevoUsers = await getUsersAndDayRow(sheets, seasonName, NUEVO_USER_START);
+	const nuevoImageRow = NUEVO_TITLE_ROW - IMAGE_ROW_SPAN;
+	const nuevoMalIds = await getMalIdsInRange(sheets, seasonName, NUEVO_TITLE_ROW, FIRST_ANIME_COL_INDEX);
+	const nuevoIndex = nuevoMalIds.indexOf(malId);
+	if (nuevoIndex !== -1) {
+		return {
+			block: 'nuevo',
+			col: FIRST_ANIME_COL_INDEX + nuevoIndex * 2,
+			imageRow: nuevoImageRow,
+			titleRow: NUEVO_TITLE_ROW,
+			userStart: NUEVO_USER_START,
+			dayRowIndex: nuevoUsers.dayRowIndex,
+			startCol: FIRST_ANIME_COL_INDEX,
+			endColBound: Infinity,
+		};
+	}
+
+	const layout = await peekContinuacionLayout(sheets, seasonName);
+	if (!layout.exists) return null;
+
+	const continuacion = await getUsersAndDayRow(sheets, seasonName, layout.userStart);
+	const [siguenStartCol, continuacionMalIds] = await Promise.all([
+		findColumnWithLabel(sheets, seasonName, layout.labelRow, SIGUEN_LABEL),
+		getMalIdsInRange(sheets, seasonName, layout.titleRow, FIRST_ANIME_COL_INDEX),
+	]);
+	const splitIndex = siguenStartCol === null ? continuacionMalIds.length : (siguenStartCol - FIRST_ANIME_COL_INDEX) / 2;
+
+	const secuelaIndex = continuacionMalIds.slice(0, splitIndex).indexOf(malId);
+	if (secuelaIndex !== -1) {
+		return {
+			block: 'secuela',
+			col: FIRST_ANIME_COL_INDEX + secuelaIndex * 2,
+			imageRow: layout.imageRow,
+			titleRow: layout.titleRow,
+			userStart: layout.userStart,
+			dayRowIndex: continuacion.dayRowIndex,
+			startCol: FIRST_ANIME_COL_INDEX,
+			endColBound: siguenStartCol ?? Infinity,
+		};
+	}
+
+	if (siguenStartCol !== null) {
+		const siguenIndex = continuacionMalIds.slice(splitIndex).indexOf(malId);
+		if (siguenIndex !== -1) {
+			return {
+				block: 'siguen',
+				col: siguenStartCol + siguenIndex * 2,
+				imageRow: layout.imageRow,
+				titleRow: layout.titleRow,
+				userStart: layout.userStart,
+				dayRowIndex: continuacion.dayRowIndex,
+				startCol: siguenStartCol,
+				endColBound: Infinity,
+			};
+		}
+	}
+
+	const abandonadosLayout = await peekAbandonadosLayout(sheets, seasonName);
+	if (!abandonadosLayout.exists) return null;
+	const abandonados = await getUsersAndDayRow(sheets, seasonName, abandonadosLayout.userStart);
+	const abandonadosMalIds = await getMalIdsInRange(sheets, seasonName, abandonadosLayout.titleRow, FIRST_ANIME_COL_INDEX);
+	const abandonadosIndex = abandonadosMalIds.indexOf(malId);
+	if (abandonadosIndex === -1) return null;
+	return {
+		block: 'abandonados',
+		col: FIRST_ANIME_COL_INDEX + abandonadosIndex * 2,
+		imageRow: abandonadosLayout.imageRow,
+		titleRow: abandonadosLayout.titleRow,
+		userStart: abandonadosLayout.userStart,
+		dayRowIndex: abandonados.dayRowIndex,
+		startCol: FIRST_ANIME_COL_INDEX,
+		endColBound: Infinity,
+	};
+}
+
+// A qué bloque debería ir un anime según sus banderas actuales — mismo criterio que usa
+// ensureAnimeColumnImpl para decidir dónde escribir.
+function targetBlockFor(anime) {
+	if (anime.isAbandoned) return 'abandonados';
+	if (anime.isCarryover) return 'siguen';
+	if (anime.isSequel) return 'secuela';
+	return 'nuevo';
+}
+
+// Mueve la columna de un anime al bloque que le corresponde HOY si ya no coincide con el bloque en el
+// que está (p. ej. se acaba de marcar o desmarcar como abandonado con setAnimeAbandoned, en db.js). No
+// hace nada si el anime todavía no tiene columna en ningún bloque (ensureAnimeColumn se encargará
+// cuando corresponda) o si ya está en el bloque correcto.
+//
+// Preserva el progreso de cada usuario (valor de la celda + color de fondo) emparejando por NOMBRE, no
+// por posición de fila: cada bloque tiene su propia lista de filas de usuario, en el orden en que fue
+// votando ahí, así que la misma persona puede estar en filas distintas en dos bloques (mismo motivo por
+// el que repairCrossBlockDuplicates no fusiona datos entre ocurrencias a ciegas).
+async function relocateAnimeColumnImpl(seasonName, anime) {
+	const sheets = await getSheetsClient();
+	const sheet = await findSheetByTitle(sheets, seasonName);
+	if (!sheet) return;
+
+	const current = await locateAnimeBlockOccurrence(sheets, seasonName, anime.malId);
+	if (!current) return;
+
+	const target = targetBlockFor(anime);
+	if (current.block === target) return;
+
+	const sheetId = sheet.properties.sheetId;
+
+	const [namesRes, cellsRes] = await Promise.all([
+		sheets.spreadsheets.values.get({
+			spreadsheetId: SPREADSHEET_ID,
+			range: `'${seasonName}'!${columnLetter(NAME_COL_INDEX)}${current.userStart}:${columnLetter(NAME_COL_INDEX)}${current.dayRowIndex - 1}`,
+		}),
+		sheets.spreadsheets.get({
+			spreadsheetId: SPREADSHEET_ID,
+			ranges: [`'${seasonName}'!${columnLetter(current.col)}${current.userStart}:${columnLetter(current.col)}${current.dayRowIndex - 1}`],
+			fields: 'sheets.data.rowData.values(formattedValue,userEnteredFormat.backgroundColor)',
+		}),
+	]);
+	const names = namesRes.data.values?.map((row) => row[0] ?? '') ?? [];
+	const cellRows = cellsRes.data.sheets?.[0]?.data?.[0]?.rowData ?? [];
+	const carried = names
+		.map((name, i) => ({
+			name,
+			value: cellRows[i]?.values?.[0]?.formattedValue ?? '',
+			color: cellRows[i]?.values?.[0]?.userEnteredFormat?.backgroundColor ?? null,
+		}))
+		.filter((entry) => entry.name && entry.value !== '');
+
+	await clearBlockColumn(sheets, sheetId, current.imageRow, current.dayRowIndex, current.col);
+	await closeGapInBlock(sheets, sheetId, seasonName, current.imageRow, current.dayRowIndex, current.titleRow, current.startCol, current.endColBound);
+	invalidateColumnCache(seasonName);
+
+	const { animeIndex: newCol, userStart: newUserStart } = await ensureAnimeColumnImpl(seasonName, anime);
+
+	for (const entry of carried) {
+		const rowIndex = await ensureUserRowImpl(seasonName, entry.name, newUserStart);
+		await sheets.spreadsheets.values.update({
+			spreadsheetId: SPREADSHEET_ID,
+			range: `'${seasonName}'!${columnLetter(newCol)}${rowIndex}`,
+			valueInputOption: 'USER_ENTERED',
+			requestBody: { values: [[entry.value]] },
+		});
+
+		const requests = [
+			...(entry.color
+				? [
+						{
+							repeatCell: {
+								range: { sheetId, startRowIndex: rowIndex - 1, endRowIndex: rowIndex, startColumnIndex: newCol, endColumnIndex: newCol + 1 },
+								cell: { userEnteredFormat: { backgroundColor: entry.color } },
+								fields: 'userEnteredFormat.backgroundColor',
+							},
+						},
+					]
+				: []),
+			{
+				setDataValidation: {
+					range: { sheetId, startRowIndex: rowIndex - 1, endRowIndex: rowIndex, startColumnIndex: newCol + 1, endColumnIndex: newCol + 2 },
+					rule: { condition: { type: 'BOOLEAN' }, strict: true },
+				},
+			},
+		];
+		await sheets.spreadsheets.batchUpdate({ spreadsheetId: SPREADSHEET_ID, requestBody: { requests } });
+	}
+
+	invalidateColumnCache(seasonName);
+}
+
 // Nombre de la pestaña inmediatamente anterior a `seasonName` (o null si no hay), para poder buscar
 // en la base local los votos/progreso de esa temporada al hacer carryover.
 async function getPreviousSeasonLabel(seasonName) {
@@ -1184,6 +1592,10 @@ function clearVote(seasonName, username, anime) {
 	return enqueue(seasonName, () => clearVoteImpl(seasonName, username, anime));
 }
 
+function relocateAnimeColumn(seasonName, anime) {
+	return enqueue(seasonName, () => relocateAnimeColumnImpl(seasonName, anime));
+}
+
 function updateAnimeDay(seasonName, anime, newDay) {
 	return enqueue(seasonName, () => updateAnimeDayImpl(seasonName, anime, newDay));
 }
@@ -1206,6 +1618,7 @@ module.exports = {
 	ensureUserRow,
 	setVote,
 	clearVote,
+	relocateAnimeColumn,
 	updateAnimeDay,
 	updateAnimeImage,
 	getPreviousTabMalIds,

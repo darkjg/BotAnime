@@ -96,6 +96,12 @@ const progressKey = (seasonLabel, malId, discordId) => `${seasonLabel}::${malId}
 // no se conocen todavía cuando se publica la temporada (se resuelven recién al votar, o al detectar
 // carryover); por eso esto hace merge campo por campo en vez de pisar el registro entero, así una
 // llamada posterior puede completar isSequel/imageUrl sin perder lo que ya había.
+//
+// isSequel/isCarryover son "pegajosos" (OR con lo que ya había, nunca bajan de true a false): la
+// heurística automática (patrón del título + relación "Prequel" en MAL) puede fallar — MAL a veces
+// tarda en cargar esa relación para animes recién agregados — y sin esto, una corrección manual (o un
+// acierto previo) se perdía en el siguiente voto que volviera a evaluar la heurística y diera false,
+// resucitando una columna duplicada en la sheet (bug real, visto dos veces).
 function upsertAnime({ malId, seasonLabel, guildId, title, url, imageUrl, broadcastDay, isSequel, isCarryover, slug }) {
 	const key = animeKey(malId, seasonLabel, guildId);
 	const existing = store.anime[key] ?? {};
@@ -107,10 +113,25 @@ function upsertAnime({ malId, seasonLabel, guildId, title, url, imageUrl, broadc
 		url: url ?? existing.url ?? null,
 		imageUrl: imageUrl ?? existing.imageUrl ?? null,
 		broadcastDay: broadcastDay ?? existing.broadcastDay ?? null,
-		isSequel: isSequel ?? existing.isSequel ?? false,
-		isCarryover: isCarryover ?? existing.isCarryover ?? false,
+		isSequel: Boolean(existing.isSequel) || Boolean(isSequel),
+		isCarryover: Boolean(existing.isCarryover) || Boolean(isCarryover),
+		// isAbandoned no se toca acá: a diferencia de isSequel/isCarryover (un hecho fijo del anime) esto
+		// refleja si ahora mismo nadie lo está viendo, así que tiene que poder subir y bajar. Se
+		// marca/desmarca aparte con setAnimeAbandoned (ver interactions.js), nunca se pisa en un voto normal.
+		isAbandoned: Boolean(existing.isAbandoned),
 		slug: slug ?? existing.slug ?? null,
 	};
+	save();
+}
+
+// Marca o desmarca un anime como "abandonado" (nadie lo sigue viendo) en TODOS los registros (uno por
+// guild) que tenga para esta temporada — mismo motivo que el loop de setVote en getAnimeAcrossGuilds:
+// es un solo hecho real, no depende de en qué guild se detectó. sheets.relocateAnimeColumn es quien
+// mueve la columna real en la sheet cuando esto cambia (ver interactions.js).
+function setAnimeAbandoned({ seasonLabel, malId, abandoned }) {
+	for (const anime of getAnimeAcrossGuilds({ seasonLabel, malId })) {
+		store.anime[animeKey(anime.malId, anime.seasonLabel, anime.guildId)] = { ...anime, isAbandoned: abandoned };
+	}
 	save();
 }
 
@@ -266,26 +287,22 @@ function setLastNotifiedAv1Episode({ seasonLabel, malId, guildId, episode }) {
 	save();
 }
 
-// Medianoche del lunes de la semana calendario (lunes a domingo) a la que pertenece `timestamp`.
-function startOfCalendarWeek(timestamp) {
-	const d = new Date(timestamp);
-	d.setHours(0, 0, 0, 0);
-	const diffToMonday = (d.getDay() + 6) % 7; // getDay(): 0=domingo, 1=lunes, ...
-	d.setDate(d.getDate() - diffToMonday);
-	return d.getTime();
-}
+// Antes comparaba semana calendario (lunes a domingo): un episodio detectado el sábado dejaba de
+// contar el martes siguiente aunque solo hubieran pasado 3 días, porque ya se había cruzado a la
+// semana calendario nueva. Cambiado a una ventana corrediza de 7 días desde la detección (pedido del
+// usuario 2026-08-11), que no tiene ese corte artificial a mitad de semana.
+const CAUGHT_UP_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
-// True si la persona ya está al día con el último episodio que animeav1 detectó para este anime Y ese
-// episodio se detectó dentro de la misma semana calendario (lunes a domingo) que ahora. Se usa para
-// tildar el check de "lo vio la semana que salió" en la sheet: ponerse al día con capítulos viejos
-// (semanas atrás, vía /recarga o /capitulo) no cuenta, solo estar al día en tiempo real. El reset
-// semanal del check en sí lo hace un script aparte de la sheet, los domingos; esto solo decide cuándo
-// tildarlo, nunca lo destilda.
+// True si la persona ya está al día con el último episodio que animeav1 detectó para este anime Y
+// todavía no pasó una semana desde que se detectó. Se usa para tildar el check de "lo vio a tiempo" en
+// la sheet: ponerse al día con capítulos viejos (semanas atrás, vía /recarga o /capitulo) no cuenta,
+// solo estar al día dentro de la primera semana. El reset semanal del check en sí lo hace un script
+// aparte de la sheet, los domingos; esto solo decide cuándo tildarlo, nunca lo destilda.
 function isCaughtUpThisWeek({ seasonLabel, malId, guildId, episodesWatched }) {
 	const { episode, detectedAt } = readAv1Entry(av1NotifiedKey(malId, seasonLabel, guildId));
 	if (!episode || !detectedAt) return false;
 	if (episodesWatched < episode) return false;
-	return startOfCalendarWeek(detectedAt) === startOfCalendarWeek(Date.now());
+	return Date.now() - detectedAt <= CAUGHT_UP_WINDOW_MS;
 }
 
 // Ventana horaria del aviso de "hoy sale capítulo" para un guild (ver DEFAULT_NOTIFY_WINDOW). Guardado
@@ -392,6 +409,7 @@ function collectDueEpisodeLinkChecks(maxAgeMs) {
 module.exports = {
 
 	upsertAnime,
+	setAnimeAbandoned,
 	recordVote,
 	removeVote,
 	getWatchers,

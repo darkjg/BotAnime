@@ -59,7 +59,8 @@ function codeBlock(text) {
 function formatEpisodeMessage(episode, dl, erai) {
 	const lines = [];
 	lines.push(`Episodio **${episode}** — Descargas`);
-	if (dl?.pageUrl) lines.push(`Fuente: ${dl.pageUrl}`);
+	// <url> en vez de url a secas: evita que Discord genere el embed de vista previa para este link.
+	if (dl?.pageUrl) lines.push(`Fuente: <${dl.pageUrl}>`);
 	if (dl?.providers) {
 		for (const [provider, urls] of dl.providers.entries()) {
 			if (!urls || urls.length === 0) continue;

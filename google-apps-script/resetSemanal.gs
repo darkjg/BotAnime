@@ -14,6 +14,19 @@
  * no llegamos a ese día dentro de la semana, no corresponde sumar ni resetear todavía, se deja para
  * la próxima corrida. También corregido nombreHoja: decía "Primavera 2026" pero la temporada activa
  * real es "Verano 2026".
+ *
+ * 2026-08-11 (pedido del usuario, tras un correo de "Exceeded maximum execution time" en syncColores):
+ * las dos funciones hacían sheet.getRange(fila, col) UNA POR UNA dentro de loops anidados — con la
+ * hoja ya en 1000+ filas eso son decenas de miles de llamadas, cada una un viaje de ida y vuelta a
+ * Sheets, y supera fácil el límite de 6 minutos de ejecución de Apps Script. Reescritas para leer y
+ * escribir la hoja entera en UN par de llamadas (getValues/getBackgrounds + setValues/setBackgrounds)
+ * y trabajar sobre esos arrays en memoria, que es prácticamente instantáneo sin importar el tamaño.
+ *
+ * De paso, encontrado y corregido un bug real en findDayRow: buscaba "Día de emisión" subiendo desde
+ * la fila del checkbox, pero esa fila queda DEBAJO de los usuarios en cada bloque (título, usuarios,
+ * "Día de emisión"), nunca arriba — así que nunca la encontraba y el chequeo de "¿ya salió esta
+ * semana?" quedaba siempre en true (no filtraba nada en la práctica). Ahora se busca la fila más
+ * cercana en la misma columna A, mirando hacia ABAJO.
  */
 
 var nombreHoja = "Verano 2026";
@@ -32,103 +45,94 @@ function todayRank() {
   return (jsDay + 6) % 7;
 }
 
-// Busca, subiendo desde `row` por la columna A, la fila donde dice "Día de emisión" (cabecera del
-// bloque de animes al que pertenece esta fila: "nuevo", "secuela" o "CONTINUAN" tienen la suya
-// propia). Devuelve null si no la encuentra.
-function findDayRow(sheet, row) {
-  for (var r = row; r >= 1; r--) {
-    if (sheet.getRange(r, 1).getValue() === DAY_LABEL) return r;
+// Para cada fila (0-based) de `values`, calcula el índice de la fila más cercana en la MISMA columna A
+// que diga "Día de emisión", buscando hacia abajo (esa fila viene siempre después de los usuarios de
+// su bloque, nunca antes). -1 si no hay ninguna debajo.
+function buildDayRowIndex(values) {
+  var lastRow = values.length;
+  var dayRowByRow = new Array(lastRow);
+  var nextDayRow = -1;
+  for (var r = lastRow - 1; r >= 0; r--) {
+    if (values[r][0] === DAY_LABEL) nextDayRow = r;
+    dayRowByRow[r] = nextDayRow;
   }
-  return null;
+  return dayRowByRow;
 }
 
-// True si el capítulo de esta semana ya debería haber salido para el anime de `animeCol`, según su
-// día de emisión: si hoy todavía no llegamos a ese día de la semana (lunes a domingo), el capítulo de
-// esta semana todavía no salió y no corresponde sumar/resetear. Si no se puede determinar el día (fila
-// no encontrada, celda vacía), no bloquea — se comporta como antes.
-function yaEmitioEstaSemana(sheet, row, animeCol) {
-  var dayRow = findDayRow(sheet, row);
-  if (!dayRow) return true;
-
-  var dia = sheet.getRange(dayRow, animeCol).getValue();
-  var rank = DAY_ORDER.indexOf(dia);
-  if (rank === -1) return true;
-
-  return todayRank() >= rank;
-}
-
+/**
+ * Recorre toda la hoja en memoria (una sola lectura de valores + colores, una sola escritura al
+ * final): por cada checkbox tildado cuyo capítulo ya salió esta semana, suma +1 a la celda de la
+ * izquierda si está en verde, y resetea el checkbox.
+ */
 function updateCountersAndReset() {
   var sheet = getSheet(nombreHoja);
   if (!sheet) return;
 
-  var lastRow = sheet.getLastRow();//Obtenemos la ultima fila
-  var lastColumn = sheet.getLastColumn();//Obtenemos la ultima columna
+  var lastRow = sheet.getLastRow();
+  var lastColumn = sheet.getLastColumn();
+  if (lastRow < 1 || lastColumn < 2) return;
 
-  // Revisamos toda la hoja
-  for (var r = 1; r <= lastRow; r++) {
-    for (var c = 2; c <= lastColumn; c++) { // empezamos en col 2 porque necesitamos c-1
-      processCheckbox(sheet, r, c);
+  var range = sheet.getRange(1, 1, lastRow, lastColumn);
+  var values = range.getValues();
+  var backgrounds = range.getBackgrounds();
+  var dayRowByRow = buildDayRowIndex(values);
+  var todayRankValue = todayRank();
+
+  var changed = false;
+  for (var row = 0; row < lastRow; row++) {
+    for (var col = 1; col < lastColumn; col++) {
+      if (values[row][col] !== true) continue; // no es un checkbox tildado
+
+      var animeCol = col - 1;
+      var dayRow = dayRowByRow[row];
+      var dia = dayRow === -1 ? null : values[dayRow][animeCol];
+      var rank = DAY_ORDER.indexOf(dia);
+      var yaEmitio = rank === -1 ? true : todayRankValue >= rank; // sin día conocido: no bloquea
+
+      if (!yaEmitio) continue; // todavía no toca esta semana: se deja para la próxima corrida
+
+      var val = values[row][animeCol];
+      var color = (backgrounds[row][animeCol] || '').toLowerCase();
+      if ((color === '#00ff00' || color === 'green') && val !== '' && !isNaN(val)) {
+        values[row][animeCol] = (parseInt(val, 10) || 0) + 1;
+      }
+      values[row][col] = false; // resetear checkbox
+      changed = true;
     }
   }
+
+  if (changed) range.setValues(values);
 }
 
 /**
- * Procesa un checkbox en la celda (r, c).
- * Si está marcado y el capítulo de esta semana ya salió, actualiza la celda de la izquierda.
+ * Sincroniza el color de fondo de cada checkbox con el de la celda de voto de al lado (una sola
+ * lectura + una sola escritura para toda la hoja).
  */
-function processCheckbox(sheet, r, c) {
-  var checkboxCell = sheet.getRange(r, c);
-  var checkboxValue = checkboxCell.getValue();// si existe chechkbox obtenemos el valor
-
-  if (checkboxValue === true) {
-    if (!yaEmitioEstaSemana(sheet, r, c - 1)) return; // todavía no toca esta semana: se deja para la próxima corrida
-
-    var targetCell = sheet.getRange(r, c - 1);//Restamos uno para indicar que el cambio se realiza en la columna anterior y misma fila
-    updateIfGreen(targetCell);
-    checkboxCell.clearContent(); // resetear checkbox
-  }
-}
-
-/**
- * Suma +1 al valor de la celda anterior si:
- *  - Tiene un número
- *  - Su color de fondo es verde
- */
-function updateIfGreen(cell) {
-  var val = cell.getValue();
-  var color = cell.getBackground().toLowerCase();
-
-  if ((color === "#00ff00" || color === "green") && val !== "" && !isNaN(val)) {
-    cell.setValue((parseInt(val, 10) || 0) + 1);
-  }
-}
-
-
 function syncColores(e) {
-   var sheet = getSheet(nombreHoja);
+  var sheet = getSheet(nombreHoja);
   if (!sheet) return;
 
   var lastRow = sheet.getLastRow();
   var lastCol = sheet.getLastColumn();
+  if (lastRow < 1 || lastCol < 2) return;
 
-  // Recorremos todas las celdas menos la última columna
-  for (var row = 1; row <= lastRow; row++) {
-    for (var col = 1; col < lastCol; col++) {
-      var cell = sheet.getRange(row, col);
-      var checkboxCell = sheet.getRange(row, col + 1);
+  var range = sheet.getRange(1, 1, lastRow, lastCol);
+  var backgrounds = range.getBackgrounds();
+  var validations = range.getDataValidations();
 
-      // Comprobar si en la celda de la derecha hay un checkbox
-      if (checkboxCell.getDataValidation() &&
-          checkboxCell.getDataValidation().getCriteriaType() == SpreadsheetApp.DataValidationCriteria.CHECKBOX) {
+  var changed = false;
+  for (var row = 0; row < lastRow; row++) {
+    for (var col = 0; col < lastCol - 1; col++) {
+      var checkboxValidation = validations[row][col + 1];
+      if (!checkboxValidation || checkboxValidation.getCriteriaType() !== SpreadsheetApp.DataValidationCriteria.CHECKBOX) continue;
 
-        var colorOriginal = cell.getBackground();
-        var colorCheckbox = checkboxCell.getBackground();
-
-        // Si los colores son distintos → sincronizar
-        if (colorOriginal !== colorCheckbox) {
-          checkboxCell.setBackground(colorOriginal);
-        }
+      var colorOriginal = backgrounds[row][col];
+      if (backgrounds[row][col + 1] !== colorOriginal) {
+        backgrounds[row][col + 1] = colorOriginal;
+        changed = true;
       }
     }
   }
+
+  if (changed) range.setBackgrounds(backgrounds);
 }
