@@ -1,413 +1,410 @@
 const fs = require('node:fs');
 const path = require('node:path');
+const { DatabaseSync } = require('node:sqlite');
+const { applySchema } = require('./dbSchema');
 
-// Antes usaba node:sqlite, pero ese módulo requiere Node 22.5+ y no hay build oficial de Node para
-// armv7l (Raspberry Pi de 32 bits) más allá de la v18. Esto guarda lo mismo en un archivo JSON
-// plano: los datos son chicos (votos, animes recordados, canales configurados) y no justifican una
-// base real, así que funciona en cualquier versión de Node sin módulos nativos que compilar.
-const DB_PATH = path.join(__dirname, '..', '..', 'botanime.json');
+// Antes esto era JSON plano (motivo histórico: node:sqlite requería Node 22.5+ sin build oficial para
+// armv7l/32 bits, la arquitectura vieja del Pi). Ahora que el Pi corre Node moderno de 64 bits, pasa a
+// ser la única fuente de verdad real: la Google Sheet es un reflejo de esto, no una base paralela (ver
+// el checkbox de "capítulo visto", que dejó de sumar por su cuenta en resetSemanal.gs).
+const DB_PATH = path.join(__dirname, '..', '..', 'botanime.sqlite');
 
-function emptyStore() {
-	return {
-		anime: {},
-		votes: {},
-		notificationChannels: {},
-		notifiedEpisodes: {},
-		av1NotifiedEpisodes: {},
-		forumChannels: {},
-		// malId/seasonLabel -> Discord threadId donde se publica el hilo del anime en el foro
-		av1ForumThreads: {},
-		activeSeasons: {},
-
-		voteRoles: {},
-		progress: {},
-		notifyWindows: {},
-		// malId/seasonLabel/guildId/episodio -> mensaje del hilo de foro con los links de descarga, para
-		// poder revisarlo unos días después y agregar proveedores que tarden más en aparecer (ver
-		// collectDueEpisodeLinkChecks).
-		episodeLinkMessages: {},
-		// guildId -> bool: si /link-fix está activado para reemplazar embeds rotos de x.com/twitter.com.
-		linkFixEnabled: {},
-	};
+if (!fs.existsSync(DB_PATH)) {
+	throw new Error(
+		`No existe ${DB_PATH}. Corré primero "node scripts/migrate-to-sqlite.js" para migrar los datos de botanime.json antes de arrancar el bot.`,
+	);
 }
+
+const db = new DatabaseSync(DB_PATH);
+db.exec('PRAGMA journal_mode = WAL');
+applySchema(db);
 
 // Ventana horaria por defecto en la que se manda el aviso de "hoy sale capítulo" (hora local del
 // servidor). endHour es exclusivo: 23 significa "hasta las 22:59".
 const DEFAULT_NOTIFY_WINDOW = { startHour: 17, endHour: 23 };
 
-function loadStore() {
-	if (!fs.existsSync(DB_PATH)) return emptyStore();
-	try {
-		return { ...emptyStore(), ...JSON.parse(fs.readFileSync(DB_PATH, 'utf8')) };
-	} catch (err) {
-		console.error(`No pude leer ${DB_PATH}, arranco con datos vacíos:`, err.message);
-		return emptyStore();
-	}
+// node:sqlite no acepta boolean/objetos crudos como parámetro (tira excepción) — hay que convertir a
+// mano a 0/1 en cada punto de escritura, y de vuelta a boolean al leer.
+const toBit = (value) => (value ? 1 : 0);
+
+function animeRowToObject(row) {
+	return { ...row, isSequel: Boolean(row.isSequel), isCarryover: Boolean(row.isCarryover), isAbandoned: Boolean(row.isAbandoned) };
 }
 
-const store = loadStore();
+// --- anime ---------------------------------------------------------------------------------------
 
-// Migración: antes el rol requerido para votar era un único VOTE_ROLE_ID global en .env, el mismo
-// para todos los guilds. Al hacerlo configurable por servidor (para poder tener un guild de pruebas
-// sin esa restricción), sembramos ese valor una sola vez para el guild de producción (GUILD_ID) así
-// no hace falta correr ningún comando a mano para no perder el comportamiento que ya tenía.
-if (process.env.GUILD_ID && process.env.VOTE_ROLE_ID && !(process.env.GUILD_ID in store.voteRoles)) {
-	store.voteRoles[process.env.GUILD_ID] = process.env.VOTE_ROLE_ID;
-	save();
-}
+const upsertAnimeStmt = db.prepare(`
+	INSERT INTO anime (guildId, seasonLabel, malId, title, url, imageUrl, broadcastDay, isSequel, isCarryover, isAbandoned, slug)
+	VALUES (@guildId, @seasonLabel, @malId, @title, @url, @imageUrl, @broadcastDay, @isSequel, @isCarryover, 0, @slug)
+	ON CONFLICT (guildId, seasonLabel, malId) DO UPDATE SET
+		title        = COALESCE(excluded.title, title),
+		url          = COALESCE(excluded.url, url),
+		imageUrl     = COALESCE(excluded.imageUrl, imageUrl),
+		broadcastDay = COALESCE(excluded.broadcastDay, broadcastDay),
+		isSequel     = MAX(isSequel, excluded.isSequel),
+		isCarryover  = MAX(isCarryover, excluded.isCarryover),
+		slug         = COALESCE(excluded.slug, slug)
+`);
 
-// Migración: antes av1NotifiedEpisodes guardaba directamente el número de episodio, sin fecha de
-// detección. Al agregar detectedAt (para isCaughtUpThisWeek, el check de "lo vio la semana que
-// salió"), las entradas viejas se quedarían sin fecha para siempre si a ese anime no le vuelven a
-// detectar un episodio nuevo (p. ej. uno que ya terminó de emitir esta temporada), y el check nunca
-// se tildaría para nadie. Se convierten una sola vez acá, usando el momento de este arranque como
-// fecha: no es la fecha real en que salió, pero deja el check utilizable desde ya en vez de nunca.
-let migratedAv1Entries = 0;
-for (const [key, value] of Object.entries(store.av1NotifiedEpisodes)) {
-	if (typeof value === 'number') {
-		store.av1NotifiedEpisodes[key] = { episode: value, detectedAt: Date.now() };
-		migratedAv1Entries += 1;
-	}
-}
-if (migratedAv1Entries > 0) {
-	console.log(`[db] migré ${migratedAv1Entries} entrada(s) vieja(s) de av1NotifiedEpisodes al formato con fecha`);
-	save();
-}
-
-function save() {
-	fs.writeFileSync(DB_PATH, JSON.stringify(store, null, 1));
-}
-
-// Incluye guildId porque dos guilds pueden compartir la misma etiqueta de temporada (ej. un guild de
-// pruebas y el de producción publicando "Verano 2026" a la vez); sin el guildId en la clave, el
-// segundo que corriera /temporada-foro pisaría el guildId guardado por el primero para todo malId
-// repetido, aunque cada uno tenga su propio canal de foro.
-const animeKey = (malId, seasonLabel, guildId) => `${guildId}::${seasonLabel}::${malId}`;
-// Incluye guildId por el mismo motivo que animeKey: si dos guilds comparten etiqueta de temporada,
-// el "último episodio avisado" de uno no debe afectar al del otro (ej. al recrear el hilo de un
-// guild de pruebas no hay que resetear el contador del hilo real de producción).
-const av1NotifiedKey = (malId, seasonLabel, guildId) => `${guildId}::${seasonLabel}::${malId}`;
-const voteKey = (seasonLabel, malId, discordId) => `${seasonLabel}::${malId}::${discordId}`;
-const progressKey = (seasonLabel, malId, discordId) => `${seasonLabel}::${malId}::${discordId}`;
-
-// Recuerda un anime publicado (título, día de emisión, a qué server/temporada pertenece) para que
-// el aviso semanal pueda encontrarlo después de un reinicio, sin depender de la caché en memoria, y
-// para poder reconstruir la pestaña de la sheet desde cero (ver rebuildSeasonTab). isSequel/isCarryover
-// no se conocen todavía cuando se publica la temporada (se resuelven recién al votar, o al detectar
-// carryover); por eso esto hace merge campo por campo en vez de pisar el registro entero, así una
-// llamada posterior puede completar isSequel/imageUrl sin perder lo que ya había.
-//
 // isSequel/isCarryover son "pegajosos" (OR con lo que ya había, nunca bajan de true a false): la
 // heurística automática (patrón del título + relación "Prequel" en MAL) puede fallar — MAL a veces
 // tarda en cargar esa relación para animes recién agregados — y sin esto, una corrección manual (o un
 // acierto previo) se perdía en el siguiente voto que volviera a evaluar la heurística y diera false,
-// resucitando una columna duplicada en la sheet (bug real, visto dos veces).
+// resucitando una columna duplicada en la sheet (bug real, visto dos veces). isAbandoned nunca se toca
+// acá (a diferencia de esas dos, sube y baja libremente): se marca/desmarca aparte con setAnimeAbandoned.
 function upsertAnime({ malId, seasonLabel, guildId, title, url, imageUrl, broadcastDay, isSequel, isCarryover, slug }) {
-	const key = animeKey(malId, seasonLabel, guildId);
-	const existing = store.anime[key] ?? {};
-	store.anime[key] = {
-		malId,
-		seasonLabel,
+	upsertAnimeStmt.run({
 		guildId,
-		title: title ?? existing.title ?? null,
-		url: url ?? existing.url ?? null,
-		imageUrl: imageUrl ?? existing.imageUrl ?? null,
-		broadcastDay: broadcastDay ?? existing.broadcastDay ?? null,
-		isSequel: Boolean(existing.isSequel) || Boolean(isSequel),
-		isCarryover: Boolean(existing.isCarryover) || Boolean(isCarryover),
-		// isAbandoned no se toca acá: a diferencia de isSequel/isCarryover (un hecho fijo del anime) esto
-		// refleja si ahora mismo nadie lo está viendo, así que tiene que poder subir y bajar. Se
-		// marca/desmarca aparte con setAnimeAbandoned (ver interactions.js), nunca se pisa en un voto normal.
-		isAbandoned: Boolean(existing.isAbandoned),
-		slug: slug ?? existing.slug ?? null,
-	};
-	save();
+		seasonLabel,
+		malId,
+		title: title ?? null,
+		url: url ?? null,
+		imageUrl: imageUrl ?? null,
+		broadcastDay: broadcastDay ?? null,
+		isSequel: toBit(isSequel),
+		isCarryover: toBit(isCarryover),
+		slug: slug ?? null,
+	});
 }
 
-// Marca o desmarca un anime como "abandonado" (nadie lo sigue viendo) en TODOS los registros (uno por
-// guild) que tenga para esta temporada — mismo motivo que el loop de setVote en getAnimeAcrossGuilds:
-// es un solo hecho real, no depende de en qué guild se detectó. sheets.relocateAnimeColumn es quien
-// mueve la columna real en la sheet cuando esto cambia (ver interactions.js).
+const setAnimeAbandonedStmt = db.prepare(`UPDATE anime SET isAbandoned = ? WHERE seasonLabel = ? AND malId = ?`);
+
+// Afecta TODOS los registros (uno por guild) de este malId+temporada de una sola vez: es un solo hecho
+// real, no depende de en qué guild se detectó (mismo motivo que getAnimeAcrossGuilds).
 function setAnimeAbandoned({ seasonLabel, malId, abandoned }) {
-	for (const anime of getAnimeAcrossGuilds({ seasonLabel, malId })) {
-		store.anime[animeKey(anime.malId, anime.seasonLabel, anime.guildId)] = { ...anime, isAbandoned: abandoned };
-	}
-	save();
+	setAnimeAbandonedStmt.run(toBit(abandoned), seasonLabel, malId);
 }
 
-// Todos los animes recordados de una temporada (para reconstruir su pestaña desde cero).
+const selectAnimeForSeasonStmt = db.prepare(`SELECT * FROM anime WHERE seasonLabel = ?`);
 function getAnimeForSeason(seasonLabel) {
-	return Object.values(store.anime).filter((a) => a.seasonLabel === seasonLabel);
+	return selectAnimeForSeasonStmt.all(seasonLabel).map(animeRowToObject);
 }
 
-// Todos los animes recordados de cualquier temporada (para reconstruir seasonCache.js desde cero si
-// hace falta, ver seasonCache.js).
+const selectAllAnimeStmt = db.prepare(`SELECT * FROM anime`);
 function getAllAnime() {
-	return Object.values(store.anime);
+	return selectAllAnimeStmt.all().map(animeRowToObject);
 }
 
-// Todos los registros (uno por guild) de un mismo anime en una temporada. malId identifica al anime
-// en sí, no depende de en qué guild se vio; y el voto/progreso de una persona es un solo hecho real,
-// no "uno por guild". Hoy todos los guilds comparten la misma sheet (SHEET_ID es uno solo), pero si
-// en el futuro cada guild apunta a la suya, escribir el voto en TODOS estos registros asegura que se
-// vea reflejado en cualquier sheet donde el anime esté, sin importar en qué guild se disparó el voto.
+const selectAnimeAcrossGuildsStmt = db.prepare(`SELECT * FROM anime WHERE seasonLabel = ? AND malId = ?`);
 function getAnimeAcrossGuilds({ seasonLabel, malId }) {
-	return getAllAnime().filter((a) => a.seasonLabel === seasonLabel && a.malId === malId);
+	return selectAnimeAcrossGuildsStmt.all(seasonLabel, malId).map(animeRowToObject);
 }
 
-// Todos los votos de una temporada (para reconstruir su pestaña desde cero).
-function getVotesForSeason(seasonLabel) {
-	return Object.values(store.votes).filter((v) => v.seasonLabel === seasonLabel);
+// --- temporadas (seasons) -------------------------------------------------------------------------
+
+const insertSeasonHistoryStmt = db.prepare(`
+	INSERT INTO seasons (guildId, seasonLabel, previousSeasonLabel, createdAt)
+	VALUES (?, ?, ?, ?)
+	ON CONFLICT (guildId, seasonLabel) DO NOTHING
+`);
+
+// Se llama al publicar una temporada nueva, ANTES de pisar la temporada activa con setActiveSeason (ver
+// temporadaShared.js). Reemplaza a sheets.getPreviousSeasonLabel, que leía el orden de las pestañas de
+// la Sheet — ahora es un hecho guardado explícitamente en la base. Idempotente (ON CONFLICT DO NOTHING):
+// si /temporada-foro se corre dos veces para la misma etiqueta, no pisa el valor real ya guardado.
+function recordSeasonHistory({ guildId, seasonLabel, previousSeasonLabel }) {
+	insertSeasonHistoryStmt.run(guildId, seasonLabel, previousSeasonLabel ?? null, Date.now());
 }
 
-// Recuerda cuál es la temporada "activa" de un guild (la última publicada con /temporada o
-// /temporada-foro), para que la reconstrucción automática sepa qué pestaña tocar sin tener que
-// adivinarlo. Se guarda una por guild porque cada servidor puede estar en una temporada distinta.
+const selectPreviousSeasonLabelStmt = db.prepare(`SELECT previousSeasonLabel FROM seasons WHERE guildId = ? AND seasonLabel = ?`);
+function getPreviousSeasonLabel({ guildId, seasonLabel }) {
+	return selectPreviousSeasonLabelStmt.get(guildId, seasonLabel)?.previousSeasonLabel ?? null;
+}
+
+// --- guild_settings (activeSeasons/notificationChannels/forumChannels/voteRoles/notifyWindows/linkFixEnabled) ---
+
+const selectGuildSettingsStmt = db.prepare(`SELECT * FROM guild_settings WHERE guildId = ?`);
+function getGuildSettingsRow(guildId) {
+	return selectGuildSettingsStmt.get(guildId) ?? null;
+}
+
+// Único guild_settings tiene muchas columnas nulleables independientes; en vez de un upsert por
+// columna, esto arma dinámicamente el UPSERT para la columna pedida. `column` siempre es un literal fijo
+// que este mismo archivo elige en cada call site (nunca algo derivado de afuera), así que no hay riesgo
+// de inyección al interpolarlo en el texto de la sentencia.
+function upsertGuildSetting(guildId, column, value) {
+	db.prepare(`INSERT INTO guild_settings (guildId, ${column}) VALUES (?, ?) ON CONFLICT (guildId) DO UPDATE SET ${column} = excluded.${column}`).run(
+		guildId,
+		value,
+	);
+}
+
 function setActiveSeason({ guildId, seasonLabel }) {
-	store.activeSeasons[guildId] = seasonLabel;
-	save();
+	upsertGuildSetting(guildId, 'activeSeasonLabel', seasonLabel);
 }
 
 function getActiveSeason(guildId) {
-	return store.activeSeasons[guildId] ?? null;
+	return getGuildSettingsRow(guildId)?.activeSeasonLabel ?? null;
 }
 
-// Lista sin duplicados de las temporadas activas de todos los guilds (varios servidores pueden
-// compartir la misma pestaña/temporada).
+const selectActiveSeasonLabelsStmt = db.prepare(`SELECT DISTINCT activeSeasonLabel FROM guild_settings WHERE activeSeasonLabel IS NOT NULL`);
 function listActiveSeasonLabels() {
-	return [...new Set(Object.values(store.activeSeasons))];
-}
-
-// "Verde"/"naranja" cuentan como que la persona sigue el anime; "rojo" se maneja con removeVote.
-function recordVote({ seasonLabel, malId, discordId, displayName, voteType }) {
-	store.votes[voteKey(seasonLabel, malId, discordId)] = { seasonLabel, malId, discordId, displayName, voteType };
-	save();
-}
-
-function removeVote({ seasonLabel, malId, discordId }) {
-	delete store.votes[voteKey(seasonLabel, malId, discordId)];
-	save();
-}
-
-function getWatchers({ seasonLabel, malId }) {
-	return Object.values(store.votes)
-		.filter((v) => v.seasonLabel === seasonLabel && v.malId === malId && (v.voteType === 'verde' || v.voteType === 'naranja'))
-		.map((v) => v.discordId);
-}
-
-// El voto de una persona puntual para un anime, o null si no votó. Se usa para saber si hay que
-// refrescar la celda de la sheet (con el capítulo nuevo) cuando cambia su progreso.
-function getUserVote({ seasonLabel, malId, discordId }) {
-	return store.votes[voteKey(seasonLabel, malId, discordId)] ?? null;
-}
-
-// malId de los animes que esta persona votó verde/naranja en la temporada (para el autocompletado de
-// /capitulo: no tiene sentido ofrecer animes que no está siguiendo).
-function getUserVotedAnime({ seasonLabel, discordId }) {
-	return Object.values(store.votes)
-		.filter((v) => v.seasonLabel === seasonLabel && v.discordId === discordId && (v.voteType === 'verde' || v.voteType === 'naranja'))
-		.map((v) => v.malId);
-}
-
-// 'verde' si alguien ya dijo que lo va a ver, si no 'naranja' si alguien lo está pensando, si no null.
-function getVoteState({ seasonLabel, malId }) {
-	const relevant = Object.values(store.votes).filter((v) => v.seasonLabel === seasonLabel && v.malId === malId);
-	if (relevant.some((v) => v.voteType === 'verde')) return 'verde';
-	if (relevant.some((v) => v.voteType === 'naranja')) return 'naranja';
-	return null;
-}
-
-// El progreso (capítulo por el que va cada persona) se guarda separado de los votos a propósito:
-// tiene que poder marcarse aunque el voto sea rojo o todavía no exista, y los botones +/- de capítulo
-// no dependen de haber votado.
-function addEpisodesWatched({ seasonLabel, malId, discordId, displayName, delta }) {
-	const key = progressKey(seasonLabel, malId, discordId);
-	const current = store.progress[key]?.episodesWatched ?? 0;
-	const episodesWatched = Math.max(0, current + delta);
-	store.progress[key] = { seasonLabel, malId, discordId, displayName, episodesWatched };
-	save();
-	return episodesWatched;
-}
-
-// Todos los que están viendo este anime (voto verde/naranja) con el capítulo por el que van (0 si
-// todavía no lo marcaron): a diferencia de mirar solo la tabla de progreso, esto muestra a TODA la
-// gente que sigue el anime aunque no haya tocado /capitulo todavía, para que el embed del hilo
-// refleje quién lo está viendo, no solo quién ya reportó avance.
-function getWatchersWithProgress({ seasonLabel, malId }) {
-	return Object.values(store.votes)
-		.filter((v) => v.seasonLabel === seasonLabel && v.malId === malId && (v.voteType === 'verde' || v.voteType === 'naranja'))
-		.map((v) => ({
-			discordId: v.discordId,
-			displayName: v.displayName,
-			episodesWatched: getEpisodesWatched({ seasonLabel, malId, discordId: v.discordId }),
-		}));
-}
-
-function getEpisodesWatched({ seasonLabel, malId, discordId }) {
-	return store.progress[progressKey(seasonLabel, malId, discordId)]?.episodesWatched ?? 0;
-}
-
-// A diferencia de addEpisodesWatched (delta +/-, para el flujo de botón+modal), esto fija el número
-// absoluto: lo usa /capitulo, donde el autocompletado ya sugiere el capítulo actual y la persona
-// escribe directamente "por cuál va", no cuánto sumar.
-function setEpisodesWatched({ seasonLabel, malId, discordId, displayName, episodesWatched }) {
-	const key = progressKey(seasonLabel, malId, discordId);
-	store.progress[key] = { seasonLabel, malId, discordId, displayName, episodesWatched: Math.max(0, episodesWatched) };
-	save();
-	return store.progress[key].episodesWatched;
+	return selectActiveSeasonLabelsStmt.all().map((row) => row.activeSeasonLabel);
 }
 
 function setNotificationChannel({ guildId, channelId }) {
-	store.notificationChannels[guildId] = channelId;
-	save();
+	upsertGuildSetting(guildId, 'notificationChannelId', channelId);
 }
 
 function getNotificationChannel(guildId) {
-	return store.notificationChannels[guildId] ?? null;
+	return getGuildSettingsRow(guildId)?.notificationChannelId ?? null;
 }
 
-// Lee una entrada de av1NotifiedEpisodes tolerando el formato viejo (antes de agregar detectedAt, la
-// entrada era directamente el número de episodio, sin fecha). Con formato viejo detectedAt queda en
-// null: no hay forma de saber en qué semana se detectó, así que isCaughtUpThisWeek lo trata como "no
-// esta semana" en vez de asumir cualquier cosa.
-function readAv1Entry(key) {
-	const raw = store.av1NotifiedEpisodes[key];
-	if (raw == null) return { episode: 0, detectedAt: null };
-	if (typeof raw === 'number') return { episode: raw, detectedAt: null };
-	return { episode: raw.episode ?? 0, detectedAt: raw.detectedAt ?? null };
+function getNotifyWindow(guildId) {
+	const row = getGuildSettingsRow(guildId);
+	if (!row || row.notifyStartHour == null || row.notifyEndHour == null) return DEFAULT_NOTIFY_WINDOW;
+	return { startHour: row.notifyStartHour, endHour: row.notifyEndHour };
 }
+
+const upsertNotifyWindowStmt = db.prepare(`
+	INSERT INTO guild_settings (guildId, notifyStartHour, notifyEndHour) VALUES (?, ?, ?)
+	ON CONFLICT (guildId) DO UPDATE SET notifyStartHour = excluded.notifyStartHour, notifyEndHour = excluded.notifyEndHour
+`);
+function setNotifyWindow({ guildId, startHour, endHour }) {
+	upsertNotifyWindowStmt.run(guildId, startHour, endHour);
+}
+
+function getVoteRole(guildId) {
+	return getGuildSettingsRow(guildId)?.voteRoleId ?? null;
+}
+
+function setVoteRole({ guildId, roleId }) {
+	upsertGuildSetting(guildId, 'voteRoleId', roleId);
+}
+
+function getLinkFixEnabled(guildId) {
+	return Boolean(getGuildSettingsRow(guildId)?.linkFixEnabled);
+}
+
+function setLinkFixEnabled(guildId, enabled) {
+	upsertGuildSetting(guildId, 'linkFixEnabled', toBit(enabled));
+}
+
+function getForumChannel(guildId) {
+	const row = getGuildSettingsRow(guildId);
+	if (!row || row.forumChannelId == null) return null;
+	return { channelId: row.forumChannelId, seasonLabel: row.forumSeasonLabel };
+}
+
+const upsertForumChannelStmt = db.prepare(`
+	INSERT INTO guild_settings (guildId, forumChannelId, forumSeasonLabel) VALUES (?, ?, ?)
+	ON CONFLICT (guildId) DO UPDATE SET forumChannelId = excluded.forumChannelId, forumSeasonLabel = excluded.forumSeasonLabel
+`);
+function setForumChannel({ guildId, channelId, seasonLabel }) {
+	upsertForumChannelStmt.run(guildId, channelId, seasonLabel);
+}
+
+// --- votes -----------------------------------------------------------------------------------------
+
+const upsertVoteStmt = db.prepare(`
+	INSERT INTO votes (seasonLabel, malId, discordId, displayName, voteType) VALUES (?, ?, ?, ?, ?)
+	ON CONFLICT (seasonLabel, malId, discordId) DO UPDATE SET displayName = excluded.displayName, voteType = excluded.voteType
+`);
+// "Verde"/"naranja" cuentan como que la persona sigue el anime; "rojo" se maneja con removeVote (nunca
+// se guarda, igual que antes).
+function recordVote({ seasonLabel, malId, discordId, displayName, voteType }) {
+	upsertVoteStmt.run(seasonLabel, malId, discordId, displayName, voteType);
+}
+
+const deleteVoteStmt = db.prepare(`DELETE FROM votes WHERE seasonLabel = ? AND malId = ? AND discordId = ?`);
+function removeVote({ seasonLabel, malId, discordId }) {
+	deleteVoteStmt.run(seasonLabel, malId, discordId);
+}
+
+const selectWatchersStmt = db.prepare(`SELECT discordId FROM votes WHERE seasonLabel = ? AND malId = ? AND voteType IN ('verde', 'naranja')`);
+function getWatchers({ seasonLabel, malId }) {
+	return selectWatchersStmt.all(seasonLabel, malId).map((row) => row.discordId);
+}
+
+const selectUserVoteStmt = db.prepare(`SELECT * FROM votes WHERE seasonLabel = ? AND malId = ? AND discordId = ?`);
+// El voto de una persona puntual para un anime, o null si no votó. Se usa para saber si hay que
+// refrescar la celda de la sheet (con el capítulo nuevo) cuando cambia su progreso.
+function getUserVote({ seasonLabel, malId, discordId }) {
+	return selectUserVoteStmt.get(seasonLabel, malId, discordId) ?? null;
+}
+
+const selectUserVotedAnimeStmt = db.prepare(
+	`SELECT malId FROM votes WHERE seasonLabel = ? AND discordId = ? AND voteType IN ('verde', 'naranja')`,
+);
+// malId de los animes que esta persona votó verde/naranja en la temporada (para el autocompletado de
+// /capitulo: no tiene sentido ofrecer animes que no está siguiendo).
+function getUserVotedAnime({ seasonLabel, discordId }) {
+	return selectUserVotedAnimeStmt.all(seasonLabel, discordId).map((row) => row.malId);
+}
+
+// 'verde' si alguien ya dijo que lo va a ver, si no 'naranja' si alguien lo está pensando, si no null.
+// El ORDER BY prioriza 'verde' sobre 'naranja' para que LIMIT 1 devuelva el que corresponde sin tener
+// que traer todas las filas.
+const selectVoteStateStmt = db.prepare(
+	`SELECT voteType FROM votes WHERE seasonLabel = ? AND malId = ? ORDER BY (voteType = 'naranja') LIMIT 1`,
+);
+function getVoteState({ seasonLabel, malId }) {
+	return selectVoteStateStmt.get(seasonLabel, malId)?.voteType ?? null;
+}
+
+// --- progress --------------------------------------------------------------------------------------
+
+const selectEpisodesWatchedStmt = db.prepare(`SELECT episodesWatched FROM progress WHERE seasonLabel = ? AND malId = ? AND discordId = ?`);
+function getEpisodesWatched({ seasonLabel, malId, discordId }) {
+	return selectEpisodesWatchedStmt.get(seasonLabel, malId, discordId)?.episodesWatched ?? 0;
+}
+
+const addEpisodesWatchedStmt = db.prepare(`
+	INSERT INTO progress (seasonLabel, malId, discordId, displayName, episodesWatched)
+	VALUES (@seasonLabel, @malId, @discordId, @displayName, MAX(0, @delta))
+	ON CONFLICT (seasonLabel, malId, discordId) DO UPDATE SET
+		displayName = excluded.displayName,
+		episodesWatched = MAX(0, episodesWatched + @delta)
+	RETURNING episodesWatched
+`);
+// El progreso (capítulo por el que va cada persona) se guarda separado de los votos a propósito: tiene
+// que poder marcarse aunque el voto sea rojo o todavía no exista, y los botones +/- de capítulo no
+// dependen de haber votado.
+function addEpisodesWatched({ seasonLabel, malId, discordId, displayName, delta }) {
+	return addEpisodesWatchedStmt.get({ seasonLabel, malId, discordId, displayName, delta }).episodesWatched;
+}
+
+const setEpisodesWatchedStmt = db.prepare(`
+	INSERT INTO progress (seasonLabel, malId, discordId, displayName, episodesWatched)
+	VALUES (@seasonLabel, @malId, @discordId, @displayName, MAX(0, @episodesWatched))
+	ON CONFLICT (seasonLabel, malId, discordId) DO UPDATE SET
+		displayName = excluded.displayName,
+		episodesWatched = MAX(0, @episodesWatched)
+	RETURNING episodesWatched
+`);
+// A diferencia de addEpisodesWatched (delta +/-, para el flujo de botón+modal), esto fija el número
+// absoluto: lo usa /capitulo, donde el autocompletado ya sugiere el capítulo actual y la persona escribe
+// directamente "por cuál va", no cuánto sumar.
+function setEpisodesWatched({ seasonLabel, malId, discordId, displayName, episodesWatched }) {
+	return setEpisodesWatchedStmt.get({ seasonLabel, malId, discordId, displayName, episodesWatched }).episodesWatched;
+}
+
+const selectVotesForSeasonStmt = db.prepare(`SELECT * FROM votes WHERE seasonLabel = ?`);
+function getVotesForSeason(seasonLabel) {
+	return selectVotesForSeasonStmt.all(seasonLabel);
+}
+
+// Todos los que están viendo este anime (voto verde/naranja) con el capítulo por el que van (0 si
+// todavía no lo marcaron): a diferencia de mirar solo la tabla de progreso, esto muestra a TODA la gente
+// que sigue el anime aunque no haya tocado /capitulo todavía, para que el embed del hilo refleje quién
+// lo está viendo, no solo quién ya reportó avance. Un solo LEFT JOIN en vez de N+1 consultas.
+const selectWatchersWithProgressStmt = db.prepare(`
+	SELECT v.discordId, v.displayName, COALESCE(p.episodesWatched, 0) AS episodesWatched
+	FROM votes v
+	LEFT JOIN progress p ON p.seasonLabel = v.seasonLabel AND p.malId = v.malId AND p.discordId = v.discordId
+	WHERE v.seasonLabel = ? AND v.malId = ? AND v.voteType IN ('verde', 'naranja')
+`);
+function getWatchersWithProgress({ seasonLabel, malId }) {
+	return selectWatchersWithProgressStmt.all(seasonLabel, malId);
+}
+
+// --- av1NotifiedEpisodes -----------------------------------------------------------------------------
+
+const selectAv1EntryStmt = db.prepare(`SELECT episode, detectedAt FROM av1_notified_episodes WHERE guildId = ? AND seasonLabel = ? AND malId = ?`);
+const upsertAv1EntryStmt = db.prepare(`
+	INSERT INTO av1_notified_episodes (guildId, seasonLabel, malId, episode, detectedAt) VALUES (?, ?, ?, ?, ?)
+	ON CONFLICT (guildId, seasonLabel, malId) DO UPDATE SET episode = excluded.episode, detectedAt = excluded.detectedAt
+`);
 
 // Último episodio de animeav1 ya avisado para este anime, para no repetir el aviso en cada chequeo.
 function getLastNotifiedAv1Episode({ seasonLabel, malId, guildId }) {
-	return readAv1Entry(av1NotifiedKey(malId, seasonLabel, guildId)).episode;
+	return selectAv1EntryStmt.get(guildId, seasonLabel, malId)?.episode ?? 0;
 }
 
 function setLastNotifiedAv1Episode({ seasonLabel, malId, guildId, episode }) {
-	store.av1NotifiedEpisodes[av1NotifiedKey(malId, seasonLabel, guildId)] = { episode, detectedAt: Date.now() };
-	save();
+	upsertAv1EntryStmt.run(guildId, seasonLabel, malId, episode, Date.now());
 }
 
-// Antes comparaba semana calendario (lunes a domingo): un episodio detectado el sábado dejaba de
-// contar el martes siguiente aunque solo hubieran pasado 3 días, porque ya se había cruzado a la
-// semana calendario nueva. Cambiado a una ventana corrediza de 7 días desde la detección (pedido del
-// usuario 2026-08-11), que no tiene ese corte artificial a mitad de semana.
+// Antes comparaba semana calendario (lunes a domingo): un episodio detectado el sábado dejaba de contar
+// el martes siguiente aunque solo hubieran pasado 3 días, porque ya se había cruzado a la semana
+// calendario nueva. Cambiado a una ventana corrediza de 7 días desde la detección (pedido del usuario
+// 2026-08-11), que no tiene ese corte artificial a mitad de semana.
 const CAUGHT_UP_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
 // True si la persona ya está al día con el último episodio que animeav1 detectó para este anime Y
 // todavía no pasó una semana desde que se detectó. Se usa para tildar el check de "lo vio a tiempo" en
-// la sheet: ponerse al día con capítulos viejos (semanas atrás, vía /recarga o /capitulo) no cuenta,
-// solo estar al día dentro de la primera semana. El reset semanal del check en sí lo hace un script
-// aparte de la sheet, los domingos; esto solo decide cuándo tildarlo, nunca lo destilda.
+// la sheet: ponerse al día con capítulos viejos (semanas atrás, vía /recarga o /capitulo) no cuenta, solo
+// estar al día dentro de la primera semana. El checkbox de la sheet es puramente visual (ver
+// resetSemanal.gs); esto solo decide cuándo tildarlo, nunca lo destilda.
 function isCaughtUpThisWeek({ seasonLabel, malId, guildId, episodesWatched }) {
-	const { episode, detectedAt } = readAv1Entry(av1NotifiedKey(malId, seasonLabel, guildId));
-	if (!episode || !detectedAt) return false;
-	if (episodesWatched < episode) return false;
-	return Date.now() - detectedAt <= CAUGHT_UP_WINDOW_MS;
+	const row = selectAv1EntryStmt.get(guildId, seasonLabel, malId);
+	if (!row || !row.episode || row.detectedAt == null) return false;
+	if (episodesWatched < row.episode) return false;
+	return Date.now() - row.detectedAt <= CAUGHT_UP_WINDOW_MS;
 }
 
-// Ventana horaria del aviso de "hoy sale capítulo" para un guild (ver DEFAULT_NOTIFY_WINDOW). Guardado
-// por guild para poder ajustarla con un comando más adelante sin afectar a otros servidores.
-function getNotifyWindow(guildId) {
-	return store.notifyWindows[guildId] ?? DEFAULT_NOTIFY_WINDOW;
-}
+// --- av1ForumThreads -----------------------------------------------------------------------------
 
-function setNotifyWindow({ guildId, startHour, endHour }) {
-	store.notifyWindows[guildId] = { startHour, endHour };
-	save();
-}
-
-// Rol requerido para votar en un guild; si no hay ninguno configurado, cualquiera puede votar ahí
-// (así el guild de pruebas puede no tener restricción sin afectar producción).
-function getVoteRole(guildId) {
-	return store.voteRoles[guildId] ?? null;
-}
-
-function setVoteRole({ guildId, roleId }) {
-	store.voteRoles[guildId] = roleId;
-	save();
-}
-
-// Si /link-fix está activado para este guild (desactivado por defecto: hay que optar explícitamente,
-// porque implica que el bot borre mensajes ajenos).
-function getLinkFixEnabled(guildId) {
-	return store.linkFixEnabled[guildId] ?? false;
-}
-
-function setLinkFixEnabled(guildId, enabled) {
-	store.linkFixEnabled[guildId] = enabled;
-	save();
-}
-
-function getForumChannel(guildId) {
-	return store.forumChannels[guildId] ?? null;
-}
-
-function setForumChannel({ guildId, channelId, seasonLabel }) {
-	store.forumChannels[guildId] = { channelId, seasonLabel };
-	save();
-}
-
-function av1ThreadKey({ guildId, seasonLabel, malId }) {
-	return `${guildId}::${seasonLabel}::${malId}`;
-}
-
+const upsertAv1ForumThreadStmt = db.prepare(`
+	INSERT INTO av1_forum_threads (guildId, seasonLabel, malId, threadId) VALUES (?, ?, ?, ?)
+	ON CONFLICT (guildId, seasonLabel, malId) DO UPDATE SET threadId = excluded.threadId
+`);
 function setAv1ForumThread({ guildId, seasonLabel, malId, threadId }) {
-	store.av1ForumThreads[av1ThreadKey({ guildId, seasonLabel, malId })] = threadId;
-	save();
+	upsertAv1ForumThreadStmt.run(guildId, seasonLabel, malId, threadId);
 }
 
+const selectAv1ForumThreadStmt = db.prepare(`SELECT threadId FROM av1_forum_threads WHERE guildId = ? AND seasonLabel = ? AND malId = ?`);
 function getAv1ForumThread({ guildId, seasonLabel, malId }) {
-	return store.av1ForumThreads[av1ThreadKey({ guildId, seasonLabel, malId })] ?? null;
+	return selectAv1ForumThreadStmt.get(guildId, seasonLabel, malId)?.threadId ?? null;
 }
 
-function episodeLinkMessageKey({ guildId, seasonLabel, malId, episode }) {
-	return `${guildId}::${seasonLabel}::${malId}::${episode}`;
-}
+// --- episodeLinkMessages -----------------------------------------------------------------------------
 
-// Recuerda el mensaje del hilo de foro donde se publicaron los links de descarga de un capítulo
-// puntual (con qué proveedores ya se incluyeron), para poder revisarlo unos días después y agregar los
-// que aparezcan más tarde (Mega/torrent suelen tardar más que 1Fichier/MP4Upload en subirse).
+const insertEpisodeLinkMessageStmt = db.prepare(`
+	INSERT INTO episode_link_messages (guildId, seasonLabel, malId, episode, title, slug, threadId, messageId, providers, hasErai, postedAt)
+	VALUES (@guildId, @seasonLabel, @malId, @episode, @title, @slug, @threadId, @messageId, @providers, @hasErai, @postedAt)
+	ON CONFLICT (guildId, seasonLabel, malId, episode) DO UPDATE SET
+		title = excluded.title, slug = excluded.slug, threadId = excluded.threadId, messageId = excluded.messageId,
+		providers = excluded.providers, hasErai = excluded.hasErai, postedAt = excluded.postedAt
+`);
+// Recuerda el mensaje del hilo de foro donde se publicaron los links de descarga de un capítulo puntual
+// (con qué proveedores ya se incluyeron), para poder revisarlo unos días después y agregar los que
+// aparezcan más tarde (Mega/torrent suelen tardar más que 1Fichier/MP4Upload en subirse).
 function recordEpisodeLinkMessage({ guildId, seasonLabel, malId, episode, title, slug, threadId, messageId, providers, hasErai }) {
-	const key = episodeLinkMessageKey({ guildId, seasonLabel, malId, episode });
-	store.episodeLinkMessages[key] = { guildId, seasonLabel, malId, episode, title, slug, threadId, messageId, providers, hasErai, postedAt: Date.now() };
-	save();
+	insertEpisodeLinkMessageStmt.run({
+		guildId,
+		seasonLabel,
+		malId,
+		episode,
+		title: title ?? null,
+		slug: slug ?? null,
+		threadId: threadId ?? null,
+		messageId: messageId ?? null,
+		providers: JSON.stringify(providers ?? []),
+		hasErai: toBit(hasErai),
+		postedAt: Date.now(),
+	});
 }
 
+const updateEpisodeLinkMessageProvidersStmt = db.prepare(`
+	UPDATE episode_link_messages SET providers = ?, hasErai = ?
+	WHERE guildId = ? AND seasonLabel = ? AND malId = ? AND episode = ?
+`);
 // Actualiza los proveedores ya vistos de una entrada existente sin tocar postedAt (la ventana de
 // rechequeo se cuenta desde la publicación original, no desde la última vez que se encontró algo
 // nuevo). No hace nada si la entrada ya no existe (p. ej. se borró por encontrar todo o por vencerse).
 function updateEpisodeLinkMessageProviders({ guildId, seasonLabel, malId, episode, providers, hasErai }) {
-	const key = episodeLinkMessageKey({ guildId, seasonLabel, malId, episode });
-	const existing = store.episodeLinkMessages[key];
-	if (!existing) return;
-	store.episodeLinkMessages[key] = { ...existing, providers, hasErai };
-	save();
+	updateEpisodeLinkMessageProvidersStmt.run(JSON.stringify(providers ?? []), toBit(hasErai), guildId, seasonLabel, malId, episode);
 }
 
+const deleteEpisodeLinkMessageStmt = db.prepare(`DELETE FROM episode_link_messages WHERE guildId = ? AND seasonLabel = ? AND malId = ? AND episode = ?`);
 function deleteEpisodeLinkMessage({ guildId, seasonLabel, malId, episode }) {
-	delete store.episodeLinkMessages[episodeLinkMessageKey({ guildId, seasonLabel, malId, episode })];
-	save();
+	deleteEpisodeLinkMessageStmt.run(guildId, seasonLabel, malId, episode);
 }
+
+const deleteExpiredEpisodeLinkMessagesStmt = db.prepare(`DELETE FROM episode_link_messages WHERE postedAt < ?`);
+const selectDueEpisodeLinkMessagesStmt = db.prepare(`SELECT * FROM episode_link_messages WHERE postedAt >= ?`);
 
 // Devuelve las entradas todavía dentro de la ventana de rechequeo (no más viejas que maxAgeMs), podando
 // de paso las que ya se pasaron: no tiene sentido seguir revisando capítulos de hace semanas para
 // siempre.
 function collectDueEpisodeLinkChecks(maxAgeMs) {
-	const now = Date.now();
-	const due = [];
-	for (const [key, entry] of Object.entries(store.episodeLinkMessages)) {
-		if (now - entry.postedAt > maxAgeMs) {
-			delete store.episodeLinkMessages[key];
-		} else {
-			due.push(entry);
-		}
-	}
-	save();
-	return due;
+	const cutoff = Date.now() - maxAgeMs;
+	deleteExpiredEpisodeLinkMessagesStmt.run(cutoff);
+	return selectDueEpisodeLinkMessagesStmt.all(cutoff).map((row) => ({ ...row, providers: JSON.parse(row.providers), hasErai: Boolean(row.hasErai) }));
 }
 
 module.exports = {
-
 	upsertAnime,
 	setAnimeAbandoned,
 	recordVote,
@@ -447,4 +444,7 @@ module.exports = {
 	setActiveSeason,
 	getActiveSeason,
 	listActiveSeasonLabels,
+
+	recordSeasonHistory,
+	getPreviousSeasonLabel,
 };

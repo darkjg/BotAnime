@@ -89,15 +89,25 @@ async function handleMessage(message) {
 		// deja el mensaje original tal cual, su embed nativo ya se ve bien.
 		if (rutasAArreglar.length === 0) return;
 
-		const enlaces = rutasAArreglar.map((ruta) => `https://fixvx.com${ruta}`);
+		// Sustituye SOLO los links que necesitan arreglo, en el lugar donde estaban dentro del texto
+		// completo (no reconstruye el mensaje desde cero): así se conserva cualquier otra cosa que haya
+		// escrito la persona (comentario, @menciones, links que no necesitaban arreglo) en vez de perderla.
+		const rutasAArreglarSet = new Set(rutasAArreglar);
+		const contenidoFinal = contenido.replace(LINK_RE, (coincidenciaCompleta, ruta) =>
+			rutasAArreglarSet.has(ruta) ? `https://fixvx.com${ruta}` : coincidenciaCompleta,
+		);
 
 		const esHilo = message.channel.isThread();
 		const canalBase = esHilo ? message.channel.parent : message.channel;
 
 		const opcionesEnvio = {
-			content: enlaces.join('\n'),
+			content: contenidoFinal,
 			username: message.member?.displayName || message.author.username,
-			avatarURL: message.author.displayAvatarURL({ extension: 'png', size: 256 }),
+			// forceStatic: sin esto, discord.js ignora extension:'png' cuando el avatar es animado (hash
+			// "a_...") y devuelve igual un .gif — visto en un caso real donde el ícono del webhook no
+			// terminaba de renderizar bien. Un .png estático siempre es válido como ícono de webhook.
+			avatarURL: message.author.displayAvatarURL({ extension: 'png', size: 256, forceStatic: true }),
+			allowedMentions: { parse: ['users', 'roles'] },
 		};
 		if (esHilo) opcionesEnvio.threadId = message.channel.id;
 
@@ -117,7 +127,7 @@ async function handleMessage(message) {
 		}
 
 		if (!mensajeEnviado) {
-			mensajeEnviado = await message.channel.send(enlaces.join('\n'));
+			mensajeEnviado = await message.channel.send({ content: contenidoFinal, allowedMentions: { parse: ['users', 'roles'] } });
 		}
 
 		registrarBorrable(mensajeEnviado.id, message.author.id);

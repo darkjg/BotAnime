@@ -935,7 +935,7 @@ async function repairSeasonTabImpl(seasonName) {
 	const sheetId = sheet.properties.sheetId;
 
 	const crossBlock = await repairCrossBlockDuplicates(sheets, sheet, seasonName);
-	const report = { crossBlock, nuevo: null, secuela: null, continuan: null, abandonados: null };
+	const report = { crossBlock, nuevo: null, secuela: null, continuan: null, abandonados: null, continuanMalIds: [] };
 
 	const nuevoUsers = await getUsersAndDayRow(sheets, seasonName, NUEVO_USER_START);
 	const nuevoImageRow = NUEVO_TITLE_ROW - IMAGE_ROW_SPAN;
@@ -964,15 +964,11 @@ async function repairSeasonTabImpl(seasonName) {
 				await shiftSectionLeft(sheets, sheet, seasonName, layout.labelRow, continuacion.dayRowIndex, siguenStartCol, desiredSiguenStartCol);
 			}
 
-			report.continuan = await repairBlock(
-				sheets,
-				sheet,
-				seasonName,
-				layout.imageRow,
-				layout.titleRow,
-				Math.min(desiredSiguenStartCol, siguenStartCol),
-				continuacion.dayRowIndex,
-			);
+			const continuanStartCol = Math.min(desiredSiguenStartCol, siguenStartCol);
+			report.continuan = await repairBlock(sheets, sheet, seasonName, layout.imageRow, layout.titleRow, continuanStartCol, continuacion.dayRowIndex);
+			// Malids físicamente en el subgrupo CONTINUAN tras la reparación, para que quien llama pueda
+			// contrastarlos contra lo que la base de datos considera carryover (ver temporada-reparar.js).
+			report.continuanMalIds = (await getMalIdsInRange(sheets, seasonName, layout.titleRow, continuanStartCol)).filter(Boolean);
 		}
 
 		// layout (de peekContinuacionLayout) no trae dayRowIndex; sin él, applyContinuacionOuterBorder
@@ -1000,6 +996,16 @@ async function repairSeasonTabImpl(seasonName) {
 	return report;
 }
 
+// Tras reordenar/cerrar huecos del bloque que se acaba de tocar, vuelve a ubicar el anime para devolver
+// su posición YA FINAL (sortBlockByDay puede haber movido la columna que recién se escribió si no
+// quedó en el lugar exacto que le toca por día) — si devolviéramos la posición de antes de reordenar,
+// quien llama (setVoteImpl) escribiría el voto en la columna equivocada. locateAnimeColumn devuelve
+// { col, userStart } (nombre histórico distinto al { animeIndex, userStart } que espera esta función).
+async function locateFinalColumn(sheets, seasonName, anime, fallback) {
+	const located = await locateAnimeColumn(sheets, seasonName, anime);
+	return located ? { animeIndex: located.col, userStart: located.userStart } : fallback;
+}
+
 // Crea la columna de un anime si todavía no existe en su bloque/subgrupo (identificado por malId).
 // Devuelve { animeIndex: colIndex absoluto de su columna de voto, userStart: fila donde empiezan
 // los usuarios de ese bloque }.
@@ -1021,8 +1027,12 @@ async function ensureAnimeColumnImpl(seasonName, anime) {
 		const targetCol = FIRST_ANIME_COL_INDEX + malIds.length * 2;
 		await ensureColumnCapacity(sheets, sheet, targetCol);
 		await writeAnimeBlock(sheets, sheet.properties.sheetId, seasonName, anime, targetCol, layout.imageRow, layout.titleRow, layout.dayRowIndex);
+		// Siempre agrega al final, así que no debería dejar huecos propios — pero un anime cercano puede
+		// haber dejado uno al moverse de acá hacia otro bloque (relocateAnimeColumn); lo cerramos de una
+		// vez en vez de esperar a que alguien corra /temporada-reparar a mano.
+		await closeGapInBlock(sheets, sheet.properties.sheetId, seasonName, layout.imageRow, layout.dayRowIndex, layout.titleRow, FIRST_ANIME_COL_INDEX);
 		invalidateColumnCache(seasonName);
-		return { animeIndex: targetCol, userStart: layout.userStart };
+		return locateFinalColumn(sheets, seasonName, anime, { animeIndex: targetCol, userStart: layout.userStart });
 	}
 
 	if (!anime.isSequel && !anime.isCarryover) {
@@ -1049,8 +1059,12 @@ async function ensureAnimeColumnImpl(seasonName, anime) {
 		await ensureColumnCapacity(sheets, sheet, targetCol);
 		const imageRow = NUEVO_TITLE_ROW - IMAGE_ROW_SPAN;
 		await writeAnimeBlock(sheets, sheet.properties.sheetId, seasonName, anime, targetCol, imageRow, NUEVO_TITLE_ROW, dayRowIndex);
+		// Reordena/cierra huecos del bloque recién tocado en el momento, en vez de dejarlo para que
+		// alguien note que "quedó descolocado" y tenga que correr /temporada-reparar a mano. Acotado a
+		// este bloque (no a toda la pestaña) para no salir caro en llamadas a la API en cada voto.
+		await repairBlock(sheets, sheet, seasonName, imageRow, NUEVO_TITLE_ROW, FIRST_ANIME_COL_INDEX, dayRowIndex);
 		invalidateColumnCache(seasonName);
-		return { animeIndex: targetCol, userStart: NUEVO_USER_START };
+		return locateFinalColumn(sheets, seasonName, anime, { animeIndex: targetCol, userStart: NUEVO_USER_START });
 	}
 
 	const layout = await resolveContinuacionLayout(sheets, seasonName);
@@ -1084,9 +1098,13 @@ async function ensureAnimeColumnImpl(seasonName, anime) {
 		}
 		await ensureColumnCapacity(sheets, sheet, targetCol);
 		await writeAnimeBlock(sheets, sheet.properties.sheetId, seasonName, anime, targetCol, layout.imageRow, layout.titleRow, layout.dayRowIndex);
+		// Reordena/cierra huecos del subgrupo secuela en el momento (acotado a él, no a CONTINUAN ni a
+		// toda la pestaña), y recién después recalcula el borde grueso de CONTINUAN sobre el layout ya
+		// final (si se reordenara después del borde, el borde podría quedar calculado sobre una foto vieja).
+		await repairBlock(sheets, sheet, seasonName, layout.imageRow, layout.titleRow, FIRST_ANIME_COL_INDEX, layout.dayRowIndex, siguenStartCol ?? Infinity);
 		await applyContinuacionOuterBorder(sheets, sheet, seasonName, layout);
 		invalidateColumnCache(seasonName);
-		return { animeIndex: targetCol, userStart: layout.userStart };
+		return locateFinalColumn(sheets, seasonName, anime, { animeIndex: targetCol, userStart: layout.userStart });
 	}
 
 	// Subgrupo "siguen" (CONTINUAN): a la derecha del subgrupo "secuela".
@@ -1121,9 +1139,12 @@ async function ensureAnimeColumnImpl(seasonName, anime) {
 	}
 	await ensureColumnCapacity(sheets, sheet, targetCol);
 	await writeAnimeBlock(sheets, sheet.properties.sheetId, seasonName, anime, targetCol, layout.imageRow, layout.titleRow, layout.dayRowIndex);
+	// Igual que en secuela: reordena/cierra huecos de CONTINUAN en el momento, acotado a ese subgrupo,
+	// y recalcula el borde grueso recién después sobre el layout ya final.
+	await repairBlock(sheets, sheet, seasonName, layout.imageRow, layout.titleRow, startCol, layout.dayRowIndex);
 	await applyContinuacionOuterBorder(sheets, sheet, seasonName, layout);
 	invalidateColumnCache(seasonName);
-	return { animeIndex: targetCol, userStart: layout.userStart };
+	return locateFinalColumn(sheets, seasonName, anime, { animeIndex: targetCol, userStart: layout.userStart });
 }
 
 async function ensureUserRowImpl(seasonName, username, userStart) {
@@ -1530,45 +1551,6 @@ async function relocateAnimeColumnImpl(seasonName, anime) {
 	invalidateColumnCache(seasonName);
 }
 
-// Nombre de la pestaña inmediatamente anterior a `seasonName` (o null si no hay), para poder buscar
-// en la base local los votos/progreso de esa temporada al hacer carryover.
-async function getPreviousSeasonLabel(seasonName) {
-	const sheets = await getSheetsClient();
-	const meta = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
-	const sorted = [...meta.data.sheets].sort((a, b) => a.properties.index - b.properties.index);
-	const currentPos = sorted.findIndex((s) => s.properties.title === seasonName);
-	const previous = currentPos === -1 ? null : sorted[currentPos + 1];
-	return previous?.properties.title ?? null;
-}
-
-// Recoge los malId de todos los animes (nuevo + continuación, ambos subgrupos) de la pestaña
-// inmediatamente anterior a `seasonName` (la que estaba en el índice 0 antes de crear ésta).
-async function getPreviousTabMalIds(seasonName) {
-	const sheets = await getSheetsClient();
-	const meta = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
-	const sorted = [...meta.data.sheets].sort((a, b) => a.properties.index - b.properties.index);
-	const currentPos = sorted.findIndex((s) => s.properties.title === seasonName);
-	const previous = currentPos === -1 ? null : sorted[currentPos + 1];
-	if (!previous) return [];
-
-	const previousTitle = previous.properties.title;
-
-	// La pestaña anterior puede no haber sido creada por el bot (formato manual antiguo) y no
-	// seguir exactamente nuestra estructura esperada; si falla, simplemente no hay carryover que detectar.
-	try {
-		const nuevoMalIds = await getMalIdsInRange(sheets, previousTitle, NUEVO_TITLE_ROW, FIRST_ANIME_COL_INDEX);
-		const continuacionLayout = await peekContinuacionLayout(sheets, previousTitle);
-		const continuacionMalIds = continuacionLayout.exists
-			? await getMalIdsInRange(sheets, previousTitle, continuacionLayout.titleRow, FIRST_ANIME_COL_INDEX)
-			: [];
-
-		return [...new Set([...nuevoMalIds, ...continuacionMalIds].filter(Boolean))];
-	} catch (err) {
-		console.error(`getPreviousTabMalIds: no pude leer "${previousTitle}", no hay carryover que detectar:`, err.message);
-		return [];
-	}
-}
-
 // Wrappers públicos: encolan por temporada para que dos llamadas concurrentes (p. ej. dos votos casi
 // simultáneos) nunca lean/escriban la misma pestaña al mismo tiempo. Las implementaciones internas
 // (*Impl) se llaman directo entre sí (sin pasar por la cola) para no auto-bloquearse.
@@ -1621,8 +1603,6 @@ module.exports = {
 	relocateAnimeColumn,
 	updateAnimeDay,
 	updateAnimeImage,
-	getPreviousTabMalIds,
-	getPreviousSeasonLabel,
 	repairSeasonTab,
 	deleteSeasonTab,
 };

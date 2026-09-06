@@ -9,7 +9,7 @@ const {
 	MessageFlags,
 } = require('discord.js');
 const { getSeasonAnime, getAnimeById } = require('../services/jikan');
-const { ensureSeasonTab, ensureAnimeColumn, getPreviousTabMalIds, getPreviousSeasonLabel, setVote } = require('../services/sheets');
+const { ensureSeasonTab, ensureAnimeColumn, setVote } = require('../services/sheets');
 const {
 	upsertAnime,
 	getVoteState,
@@ -18,9 +18,13 @@ const {
 	setAv1ForumThread,
 	setLastNotifiedAv1Episode,
 	setActiveSeason,
+	getActiveSeason,
+	recordSeasonHistory,
+	getPreviousSeasonLabel,
 
 	getVoteRole,
 	getVotesForSeason,
+	getAnimeForSeason,
 	recordVote,
 	getEpisodesWatched,
 	setEpisodesWatched,
@@ -159,7 +163,14 @@ async function prepareSeason({ guildId, year, season, nombreOverride }) {
 	anime.forEach(rememberAnime);
 	const seasonSlug = slugForCustomId(seasonLabel);
 	rememberSeasonLabel(seasonSlug, seasonLabel);
+
+	// Capturar la temporada activa ANTES de pisarla: es lo que addCarryoverAnime necesita para saber
+	// "cuál es la temporada anterior" desde la base, en vez de leer el orden de pestañas de la Sheet.
+	const previousActiveSeasonLabel = getActiveSeason(guildId);
 	setActiveSeason({ guildId, seasonLabel });
+	if (previousActiveSeasonLabel && previousActiveSeasonLabel !== seasonLabel) {
+		recordSeasonHistory({ guildId, seasonLabel, previousSeasonLabel: previousActiveSeasonLabel });
+	}
 
 	for (const entry of anime) {
 		upsertAnime({
@@ -189,13 +200,19 @@ function isActuallyAiring(anime) {
 	return new Date(anime.airedTo) >= new Date();
 }
 
-// Animes que ya estaban en la pestaña anterior (en cualquiera de sus bloques) y que en MAL siguen
-// emitiéndose se agregan directo al subgrupo CONTINUAN, sin esperar a que alguien vote.
-// El orden por día de emisión dentro de la sheet lo decide ensureAnimeColumn al insertar.
+// Animes que ya estaban en la temporada anterior (cualquiera que no esté marcado como abandonado) y que
+// en MAL siguen emitiéndose se agregan directo al subgrupo CONTINUAN, sin esperar a que alguien vote.
+// El orden por día de emisión dentro de la sheet lo decide ensureAnimeColumn al insertar. "Temporada
+// anterior" sale de la base (recordSeasonHistory, ver prepareSeason) en vez de leer el orden de pestañas
+// de la Sheet.
 async function addCarryoverAnime(seasonLabel, currentSeasonAnime, guildId) {
 	const currentMalIds = new Set(currentSeasonAnime.map((a) => a.malId));
-	const previousMalIds = await getPreviousTabMalIds(seasonLabel);
-	const previousSeasonLabel = await getPreviousSeasonLabel(seasonLabel);
+	const previousSeasonLabel = getPreviousSeasonLabel({ guildId, seasonLabel });
+	const previousMalIds = previousSeasonLabel
+		? getAnimeForSeason(previousSeasonLabel)
+				.filter((a) => a.guildId === guildId && !a.isAbandoned)
+				.map((a) => a.malId)
+		: [];
 
 	console.log(`[temporada] revisando ${previousMalIds.length} animes de la temporada anterior para carryover...`);
 	let count = 0;
