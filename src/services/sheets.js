@@ -1,6 +1,7 @@
 const { google } = require('googleapis');
+const { conReintentoDeCuota } = require('./reintento');
 
-const SPREADSHEET_ID = process.env.SHEET_ID;
+const { conHoja, hojaActual } = require('./sheetTarget');
 const KEY_FILE = process.env.GOOGLE_APPLICATION_CREDENTIALS || 'credentials.json';
 
 // Layout (1-indexed rows/cols como en Sheets):
@@ -36,7 +37,7 @@ function broadcastDayRank(day) {
 const animeColumnCache = new Map();
 
 function invalidateColumnCache(seasonName) {
-	const prefix = `${seasonName}::`;
+	const prefix = `${hojaActual()}|${seasonName}::`;
 	for (const key of animeColumnCache.keys()) {
 		if (key.startsWith(prefix)) animeColumnCache.delete(key);
 	}
@@ -50,9 +51,13 @@ function invalidateColumnCache(seasonName) {
 const seasonQueues = new Map();
 
 function enqueue(seasonName, task) {
-	const previous = seasonQueues.get(seasonName) ?? Promise.resolve();
-	const current = previous.catch(() => {}).then(task);
-	seasonQueues.set(seasonName, current);
+	// La cola es por hoja Y temporada (dos servidores pueden tener la misma temporada en hojas distintas), y la
+	// tarea corre con la hoja que estaba activa al encolarla, no con la del momento en que le toca el turno.
+	const hoja = hojaActual();
+	const clave = `${hoja}|${seasonName}`;
+	const previous = seasonQueues.get(clave) ?? Promise.resolve();
+	const current = previous.catch(() => {}).then(() => conHoja(hoja, task));
+	seasonQueues.set(clave, current);
 	return current;
 }
 
@@ -93,9 +98,18 @@ function columnLetter(index) {
 	return letter;
 }
 
+// Google considera únicos los nombres de pestaña SIN distinguir mayúsculas: pedirle crear "otoño 2026"
+// cuando ya existe "Otoño 2026" falla con "already exists". Por eso se busca primero exacto y, si no hay,
+// ignorando mayúsculas: así un desliz de casing encuentra la pestaña que Google ya considera la misma, en
+// vez de intentar duplicarla. Los acentos SÍ distinguen para Google ("Otono" no es "Otoño"), así que no se
+// normalizan — hacerlo podría devolver una pestaña equivocada.
 async function findSheetByTitle(sheets, title) {
-	const meta = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
-	return meta.data.sheets.find((s) => s.properties.title === title) ?? null;
+	const meta = await sheets.spreadsheets.get({ spreadsheetId: hojaActual() });
+	const exacta = meta.data.sheets.find((s) => s.properties.title === title);
+	if (exacta) return exacta;
+
+	const buscado = String(title).toLowerCase();
+	return meta.data.sheets.find((s) => s.properties.title.toLowerCase() === buscado) ?? null;
 }
 
 // El texto de la celda de título puede ser un apodo editado a mano; identificamos el anime por el
@@ -108,7 +122,7 @@ async function findSheetByTitle(sheets, title) {
 // cubre toda la fila.
 async function getMalIdsInRange(sheets, title, titleRow, startCol = FIRST_ANIME_COL_INDEX, endCol = Infinity) {
 	const res = await sheets.spreadsheets.get({
-		spreadsheetId: SPREADSHEET_ID,
+		spreadsheetId: hojaActual(),
 		ranges: [`'${title}'!${titleRow}:${titleRow}`],
 		fields: 'sheets.data.rowData.values(userEnteredValue.formulaValue,hyperlink,textFormatRuns.format.link.uri)',
 	});
@@ -130,7 +144,7 @@ async function getMalIdsInRange(sheets, title, titleRow, startCol = FIRST_ANIME_
 // fila. Por eso la detección de huecos usa esta máscara de "tiene contenido" en vez de "tiene malId".
 async function getOccupiedMask(sheets, title, titleRow, startCol = FIRST_ANIME_COL_INDEX, endCol = Infinity) {
 	const res = await sheets.spreadsheets.get({
-		spreadsheetId: SPREADSHEET_ID,
+		spreadsheetId: hojaActual(),
 		ranges: [`'${title}'!${titleRow}:${titleRow}`],
 		fields: 'sheets.data.rowData.values(userEnteredValue,formattedValue,hyperlink)',
 	});
@@ -146,7 +160,7 @@ async function getOccupiedMask(sheets, title, titleRow, startCol = FIRST_ANIME_C
 // Busca en una fila el índice de columna (absoluto) donde aparece exactamente `label`.
 async function findColumnWithLabel(sheets, title, row, label) {
 	const res = await sheets.spreadsheets.values.get({
-		spreadsheetId: SPREADSHEET_ID,
+		spreadsheetId: hojaActual(),
 		range: `'${title}'!${row}:${row}`,
 	});
 	const values = res.data.values?.[0] ?? [];
@@ -157,7 +171,7 @@ async function findColumnWithLabel(sheets, title, row, label) {
 // Devuelve { dayRowIndex, userNames } buscando "Día de emisión" en la columna A a partir de userStart.
 async function getUsersAndDayRow(sheets, title, userStart) {
 	const res = await sheets.spreadsheets.values.get({
-		spreadsheetId: SPREADSHEET_ID,
+		spreadsheetId: hojaActual(),
 		range: `'${title}'!${columnLetter(NAME_COL_INDEX)}${userStart}:${columnLetter(NAME_COL_INDEX)}`,
 	});
 	const values = res.data.values?.map((row) => row[0] ?? '') ?? [];
@@ -182,7 +196,7 @@ async function peekContinuacionLayout(sheets, title) {
 	const searchStart = nuevo.dayRowIndex + 1;
 	const searchEnd = defaultLabelRow + 3;
 	const res = await sheets.spreadsheets.values.get({
-		spreadsheetId: SPREADSHEET_ID,
+		spreadsheetId: hojaActual(),
 		range: `'${title}'!${columnLetter(NAME_COL_INDEX)}${searchStart}:${columnLetter(NAME_COL_INDEX)}${searchEnd}`,
 	});
 	const values = res.data.values ?? [];
@@ -194,7 +208,7 @@ async function peekContinuacionLayout(sheets, title) {
 	const userStart = titleRow + 1;
 
 	const headerCheck = await sheets.spreadsheets.values.get({
-		spreadsheetId: SPREADSHEET_ID,
+		spreadsheetId: hojaActual(),
 		range: `'${title}'!A${titleRow}`,
 	});
 	return { labelRow, imageRow, titleRow, userStart, exists: Boolean(headerCheck.data.values) };
@@ -207,7 +221,7 @@ async function resolveContinuacionLayout(sheets, title) {
 
 	if (!layout.exists) {
 		await sheets.spreadsheets.values.batchUpdate({
-			spreadsheetId: SPREADSHEET_ID,
+			spreadsheetId: hojaActual(),
 			requestBody: {
 				valueInputOption: 'RAW',
 				data: [
@@ -239,7 +253,7 @@ async function peekAbandonadosLayout(sheets, title) {
 	const searchStart = anchorDayRow + 1;
 	const searchEnd = defaultLabelRow + 3;
 	const res = await sheets.spreadsheets.values.get({
-		spreadsheetId: SPREADSHEET_ID,
+		spreadsheetId: hojaActual(),
 		range: `'${title}'!${columnLetter(NAME_COL_INDEX)}${searchStart}:${columnLetter(NAME_COL_INDEX)}${searchEnd}`,
 	});
 	const values = res.data.values ?? [];
@@ -251,7 +265,7 @@ async function peekAbandonadosLayout(sheets, title) {
 	const userStart = titleRow + 1;
 
 	const headerCheck = await sheets.spreadsheets.values.get({
-		spreadsheetId: SPREADSHEET_ID,
+		spreadsheetId: hojaActual(),
 		range: `'${title}'!A${titleRow}`,
 	});
 	return { labelRow, imageRow, titleRow, userStart, exists: Boolean(headerCheck.data.values) };
@@ -263,7 +277,7 @@ async function resolveAbandonadosLayout(sheets, title) {
 
 	if (!layout.exists) {
 		await sheets.spreadsheets.values.batchUpdate({
-			spreadsheetId: SPREADSHEET_ID,
+			spreadsheetId: hojaActual(),
 			requestBody: {
 				valueInputOption: 'RAW',
 				data: [
@@ -283,7 +297,7 @@ async function ensureColumnCapacity(sheets, sheet, targetCol) {
 	const needed = targetCol + 2;
 	if (needed > sheet.properties.gridProperties.columnCount) {
 		await sheets.spreadsheets.batchUpdate({
-			spreadsheetId: SPREADSHEET_ID,
+			spreadsheetId: hojaActual(),
 			requestBody: {
 				requests: [
 					{
@@ -303,7 +317,7 @@ async function writeAnimeBlock(sheets, sheetId, title, anime, voteCol, imageRow,
 	const col = columnLetter(voteCol);
 
 	await sheets.spreadsheets.values.batchUpdate({
-		spreadsheetId: SPREADSHEET_ID,
+		spreadsheetId: hojaActual(),
 		requestBody: {
 			valueInputOption: 'USER_ENTERED',
 			data: [
@@ -320,7 +334,7 @@ async function writeAnimeBlock(sheets, sheetId, title, anime, voteCol, imageRow,
 	const checkboxCol = voteCol + 1;
 
 	await sheets.spreadsheets.batchUpdate({
-		spreadsheetId: SPREADSHEET_ID,
+		spreadsheetId: hojaActual(),
 		requestBody: {
 			requests: [
 				{
@@ -469,12 +483,12 @@ async function applyContinuacionOuterBorder(sheets, sheet, title, layout) {
 	}
 
 	if (requests.length === 0) return;
-	await sheets.spreadsheets.batchUpdate({ spreadsheetId: SPREADSHEET_ID, requestBody: { requests } });
+	await sheets.spreadsheets.batchUpdate({ spreadsheetId: hojaActual(), requestBody: { requests } });
 }
 
 async function writeLegendAndHeader(sheets, sheetId, title) {
 	await sheets.spreadsheets.values.batchUpdate({
-		spreadsheetId: SPREADSHEET_ID,
+		spreadsheetId: hojaActual(),
 		requestBody: {
 			valueInputOption: 'RAW',
 			data: [
@@ -488,7 +502,7 @@ async function writeLegendAndHeader(sheets, sheetId, title) {
 	});
 
 	await sheets.spreadsheets.batchUpdate({
-		spreadsheetId: SPREADSHEET_ID,
+		spreadsheetId: hojaActual(),
 		requestBody: {
 			requests: [
 				...LEGEND.flatMap((entry, i) => {
@@ -528,18 +542,22 @@ async function writeLegendAndHeader(sheets, sheetId, title) {
 // Crea la pestaña (con leyenda y cabecera del bloque "nuevo") si no existe todavía. No escribe
 // ningún anime: las columnas se crean al vuelo (ver ensureAnimeColumn) solo cuando alguien vota
 // verde/naranja, en el bloque/subgrupo que corresponda.
+// Devuelve el nombre REAL de la pestaña. Si ya existía pero con otras mayúsculas, ese nombre es el que
+// vale: quien llama debe adoptarlo como seasonLabel, porque los votos/hilos/progreso de la base van
+// indexados por esa cadena y usar otra variante partiría la temporada en dos.
 async function ensureSeasonTabImpl(seasonName) {
 	const sheets = await getSheetsClient();
 	const sheet = await findSheetByTitle(sheets, seasonName);
-	if (sheet) return;
+	if (sheet) return sheet.properties.title;
 
 	const created = await sheets.spreadsheets.batchUpdate({
-		spreadsheetId: SPREADSHEET_ID,
+		spreadsheetId: hojaActual(),
 		requestBody: {
 			requests: [{ addSheet: { properties: { title: seasonName, index: 0, gridProperties: { columnCount: 26 } } } }],
 		},
 	});
 	await writeLegendAndHeader(sheets, created.data.replies[0].addSheet.properties.sheetId, seasonName);
+	return seasonName;
 }
 
 // Borra la pestaña de una temporada si existe (no hace nada si no existe). Se usa para reconstruirla
@@ -551,7 +569,7 @@ async function deleteSeasonTabImpl(seasonName) {
 	if (!sheet) return;
 
 	await sheets.spreadsheets.batchUpdate({
-		spreadsheetId: SPREADSHEET_ID,
+		spreadsheetId: hojaActual(),
 		requestBody: { requests: [{ deleteSheet: { sheetId: sheet.properties.sheetId } }] },
 	});
 	invalidateColumnCache(seasonName);
@@ -566,7 +584,7 @@ async function findSortedInsertionColumn(sheets, title, dayRowIndex, startCol, c
 	if (count === 0) return { col: startCol, insertBefore: false };
 
 	const res = await sheets.spreadsheets.values.get({
-		spreadsheetId: SPREADSHEET_ID,
+		spreadsheetId: hojaActual(),
 		range: `'${title}'!${dayRowIndex}:${dayRowIndex}`,
 	});
 	const row = res.data.values?.[0] ?? [];
@@ -586,7 +604,7 @@ async function findSortedInsertionColumn(sheets, title, dayRowIndex, startCol, c
 // antes de que writeAnimeBlock/setVote escriban lo suyo.
 async function insertColumnsAt(sheets, sheetId, col) {
 	await sheets.spreadsheets.batchUpdate({
-		spreadsheetId: SPREADSHEET_ID,
+		spreadsheetId: hojaActual(),
 		requestBody: {
 			requests: [
 				{
@@ -622,7 +640,7 @@ async function closeGapInBlock(sheets, sheetId, title, rowStart, rowEnd, titleRo
 	const blockEndCol = startCol + occupied.length * 2;
 
 	await sheets.spreadsheets.batchUpdate({
-		spreadsheetId: SPREADSHEET_ID,
+		spreadsheetId: hojaActual(),
 		requestBody: {
 			requests: [
 				{
@@ -689,7 +707,7 @@ async function repairAbandonadosBlock(sheets, sheetId, title) {
 // duplicadas detectadas por repairBlock.
 async function clearBlockColumn(sheets, sheetId, rowStart, rowEnd, col) {
 	await sheets.spreadsheets.batchUpdate({
-		spreadsheetId: SPREADSHEET_ID,
+		spreadsheetId: hojaActual(),
 		requestBody: {
 			requests: [
 				{
@@ -717,7 +735,7 @@ async function clearBlockColumn(sheets, sheetId, rowStart, rowEnd, col) {
 async function shiftSectionLeft(sheets, sheet, title, rowStart, rowEnd, fromCol, toCol) {
 	if (fromCol <= toCol) return;
 	await sheets.spreadsheets.batchUpdate({
-		spreadsheetId: SPREADSHEET_ID,
+		spreadsheetId: hojaActual(),
 		requestBody: {
 			requests: [
 				{
@@ -754,7 +772,7 @@ async function shiftSectionLeft(sheets, sheet, title, rowStart, rowEnd, fromCol,
 async function sortBlockByDay(sheets, sheet, title, rowStart, titleRow, startCol, dayRowIndex, endColBound = Infinity) {
 	const [malIds, dayRowRes] = await Promise.all([
 		getMalIdsInRange(sheets, title, titleRow, startCol, endColBound),
-		sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `'${title}'!${dayRowIndex}:${dayRowIndex}` }),
+		sheets.spreadsheets.values.get({ spreadsheetId: hojaActual(), range: `'${title}'!${dayRowIndex}:${dayRowIndex}` }),
 	]);
 	if (malIds.length <= 1) return 0;
 
@@ -791,7 +809,7 @@ async function sortBlockByDay(sheets, sheet, title, rowStart, titleRow, startCol
 		{ cutPaste: { source: rangeAt(tempCol), destination: { sheetId, rowIndex: rowStart - 1, columnIndex: destCol }, pasteType: 'PASTE_NORMAL' } },
 	]);
 
-	await sheets.spreadsheets.batchUpdate({ spreadsheetId: SPREADSHEET_ID, requestBody: { requests } });
+	await sheets.spreadsheets.batchUpdate({ spreadsheetId: hojaActual(), requestBody: { requests } });
 	return moves.length;
 }
 
@@ -894,12 +912,18 @@ async function repairCrossBlockDuplicates(sheets, sheet, seasonName) {
 	for (const [malId, occs] of byMalId) {
 		if (occs.length <= 1) continue;
 
+		// 🐛 Mismo caso que en relocateAnimeColumnImpl: si una ocurrencia se quedó sin ninguna fila de
+		// usuario (userStart === dayRowIndex), el rango queda invertido y la API de Sheets lo
+		// normaliza sola devolviendo la fila de CABECERA en vez de nada — contaría como "1 valor" sin
+		// serlo. Sin filas de usuario no hay nada que leer, se evita la llamada directamente.
 		const reads = await Promise.all(
 			occs.map((occ) =>
-				sheets.spreadsheets.values.get({
-					spreadsheetId: SPREADSHEET_ID,
-					range: `'${seasonName}'!${columnLetter(occ.col)}${occ.userStart}:${columnLetter(occ.col)}${occ.dayRowIndex - 1}`,
-				}),
+				occ.dayRowIndex - 1 >= occ.userStart
+					? sheets.spreadsheets.values.get({
+							spreadsheetId: hojaActual(),
+							range: `'${seasonName}'!${columnLetter(occ.col)}${occ.userStart}:${columnLetter(occ.col)}${occ.dayRowIndex - 1}`,
+						})
+					: Promise.resolve({ data: { values: [] } }),
 			),
 		);
 		const valuesPerOcc = reads.map((r) => (r.data.values ?? []).map((row) => (row[0] ?? '').toString()));
@@ -1113,7 +1137,7 @@ async function ensureAnimeColumnImpl(seasonName, anime) {
 	if (startCol === null) {
 		startCol = FIRST_ANIME_COL_INDEX + secuelaCount * 2;
 		await sheets.spreadsheets.values.update({
-			spreadsheetId: SPREADSHEET_ID,
+			spreadsheetId: hojaActual(),
 			range: `'${seasonName}'!${columnLetter(startCol)}${layout.labelRow}`,
 			valueInputOption: 'RAW',
 			requestBody: { values: [[SIGUEN_LABEL]] },
@@ -1157,7 +1181,7 @@ async function ensureUserRowImpl(seasonName, username, userStart) {
 	if (existingIndex !== -1) return userStart + existingIndex;
 
 	await sheets.spreadsheets.batchUpdate({
-		spreadsheetId: SPREADSHEET_ID,
+		spreadsheetId: hojaActual(),
 		requestBody: {
 			requests: [
 				{
@@ -1171,12 +1195,110 @@ async function ensureUserRowImpl(seasonName, username, userStart) {
 	});
 
 	await sheets.spreadsheets.values.update({
-		spreadsheetId: SPREADSHEET_ID,
+		spreadsheetId: hojaActual(),
 		range: `'${seasonName}'!${columnLetter(NAME_COL_INDEX)}${dayRowIndex}`,
 		valueInputOption: 'RAW',
 		requestBody: { values: [[username]] },
 	});
 	return dayRowIndex;
+}
+
+// malId de cada columna de ese bloque donde la fila `rowIndex` tiene un voto no vacío — para saber,
+// antes de borrar su fila, qué animes hay que revisar después por si se quedaron sin nadie viéndolos
+// (ver deleteUserRowImpl). null en una posición cuenta como "sin malId reconocible" (ver
+// getMalIdsInRange) y se descarta.
+async function malIdsVotadosEnFila(sheets, seasonName, titleRow, rowIndex) {
+	const [malIds, rowRes] = await Promise.all([
+		getMalIdsInRange(sheets, seasonName, titleRow, FIRST_ANIME_COL_INDEX),
+		sheets.spreadsheets.values.get({
+			spreadsheetId: hojaActual(),
+			range: `'${seasonName}'!${rowIndex}:${rowIndex}`,
+		}),
+	]);
+	const rowValues = rowRes.data.values?.[0] ?? [];
+	const encontrados = [];
+	for (let i = 0; i < malIds.length; i += 1) {
+		const col = FIRST_ANIME_COL_INDEX + i * 2;
+		const valor = rowValues[col];
+		if (malIds[i] != null && valor != null && String(valor).trim() !== '') encontrados.push(malIds[i]);
+	}
+	return encontrados;
+}
+
+// Para /quitar-usuario (y la limpieza manual por nombre): borra su fila (nombre + todos sus votos de
+// ese bloque) en los tres bloques que puedan tener lista de personas (NUEVO/CONTINUACIÓN/ABANDONADOS)
+// — a diferencia de las columnas de anime, las filas de persona son independientes por bloque (ver
+// ensureUserRowImpl: cada bloque tiene su propio userStart), así que puede tener fila en más de uno a
+// la vez. Devuelve también los malId que votaba (de los TRES bloques juntos, sin duplicados) para que
+// quien llama pueda revisar después si algún anime se quedó sin nadie viéndolo (ver syncAbandonedState
+// en interactions.js) — necesario en el caso de /limpiar-nombre-hoja, que no tiene esa información en
+// la BD (la persona ya no tiene votos ahí, por eso hace falta limpiar por nombre en la hoja).
+// Orden de abajo arriba a propósito: borrar una fila desplaza hacia arriba todo lo que hay debajo
+// DENTRO de ese mismo bloque y de los bloques siguientes — procesando ABANDONADOS primero, luego
+// CONTINUACIÓN y NUEVO al final, cada bloque ya se borra con las posiciones recién releídas y los
+// bloques anteriores (más arriba) nunca se ven afectados por lo que se borra después.
+async function deleteUserRowImpl(seasonName, username) {
+	const sheets = await getSheetsClient();
+	const sheet = await findSheetByTitle(sheets, seasonName);
+	if (!sheet) return { borrada: false, malIds: [] };
+
+	let borrada = false;
+	const malIds = new Set();
+
+	const abandonadosLayout = await peekAbandonadosLayout(sheets, seasonName);
+	if (abandonadosLayout.exists) {
+		const { userStart, titleRow } = abandonadosLayout;
+		const { userNames } = await getUsersAndDayRow(sheets, seasonName, userStart);
+		const idx = userNames.indexOf(username);
+		if (idx !== -1) {
+			const rowIndex = userStart + idx;
+			(await malIdsVotadosEnFila(sheets, seasonName, titleRow, rowIndex)).forEach((id) => malIds.add(id));
+			await borrarFila(sheets, sheet.properties.sheetId, rowIndex);
+			borrada = true;
+		}
+	}
+
+	const continuacionLayout = await peekContinuacionLayout(sheets, seasonName);
+	if (continuacionLayout.exists) {
+		const { userStart, titleRow } = continuacionLayout;
+		const { userNames } = await getUsersAndDayRow(sheets, seasonName, userStart);
+		const idx = userNames.indexOf(username);
+		if (idx !== -1) {
+			const rowIndex = userStart + idx;
+			(await malIdsVotadosEnFila(sheets, seasonName, titleRow, rowIndex)).forEach((id) => malIds.add(id));
+			await borrarFila(sheets, sheet.properties.sheetId, rowIndex);
+			borrada = true;
+		}
+	}
+
+	{
+		const { userNames } = await getUsersAndDayRow(sheets, seasonName, NUEVO_USER_START);
+		const idx = userNames.indexOf(username);
+		if (idx !== -1) {
+			const rowIndex = NUEVO_USER_START + idx;
+			(await malIdsVotadosEnFila(sheets, seasonName, NUEVO_TITLE_ROW, rowIndex)).forEach((id) => malIds.add(id));
+			await borrarFila(sheets, sheet.properties.sheetId, rowIndex);
+			borrada = true;
+		}
+	}
+
+	invalidateColumnCache(seasonName);
+	return { borrada, malIds: [...malIds] };
+}
+
+async function borrarFila(sheets, sheetId, rowIndex1Based) {
+	await sheets.spreadsheets.batchUpdate({
+		spreadsheetId: hojaActual(),
+		requestBody: {
+			requests: [
+				{
+					deleteDimension: {
+						range: { sheetId, dimension: 'ROWS', startIndex: rowIndex1Based - 1, endIndex: rowIndex1Based },
+					},
+				},
+			],
+		},
+	});
 }
 
 // "No lo veré" (rojo) nunca se escribe en la sheet: ni columna, ni fila, ni voto. episodesWatched es
@@ -1195,7 +1317,7 @@ async function setVoteImpl(seasonName, username, anime, voteType, episodesWatche
 
 	const cellA1 = `${columnLetter(colIndex)}${rowIndex}`;
 	await sheets.spreadsheets.values.update({
-		spreadsheetId: SPREADSHEET_ID,
+		spreadsheetId: hojaActual(),
 		range: `'${seasonName}'!${cellA1}`,
 		valueInputOption: 'USER_ENTERED',
 		requestBody: { values: [[String(episodesWatched)]] },
@@ -1210,7 +1332,7 @@ async function setVoteImpl(seasonName, username, anime, voteType, episodesWatche
 	};
 
 	await sheets.spreadsheets.batchUpdate({
-		spreadsheetId: SPREADSHEET_ID,
+		spreadsheetId: hojaActual(),
 		requestBody: {
 			requests: [
 				{
@@ -1254,7 +1376,7 @@ async function setVoteImpl(seasonName, username, anime, voteType, episodesWatche
 // Ubica la columna de voto de un anime sin crear nada (a diferencia de ensureAnimeColumn), usando
 // la caché en memoria cuando ya se resolvió antes para esta temporada.
 async function findAnimeColumn(sheets, seasonName, anime) {
-	const cacheKey = `${seasonName}::${anime.malId}`;
+	const cacheKey = `${hojaActual()}|${seasonName}::${anime.malId}`;
 	if (animeColumnCache.has(cacheKey)) return animeColumnCache.get(cacheKey);
 
 	const result = await locateAnimeColumn(sheets, seasonName, anime);
@@ -1307,10 +1429,27 @@ async function updateAnimeDayImpl(seasonName, anime, newDay) {
 
 	const { dayRowIndex } = await getUsersAndDayRow(sheets, seasonName, animeLoc.userStart);
 	await sheets.spreadsheets.values.update({
-		spreadsheetId: SPREADSHEET_ID,
+		spreadsheetId: hojaActual(),
 		range: `'${seasonName}'!${columnLetter(animeLoc.col)}${dayRowIndex}`,
 		valueInputOption: 'RAW',
 		requestBody: { values: [[newDay ?? '']] },
+	});
+	return true;
+}
+
+// Corrige el título ya escrito de un anime existente (ej. al ponerle/quitarle un apodo con /apodo, ver
+// db.js:getDisplayTitle) sin mover su columna. Misma fórmula que escribe writeAnimeBlock al crearla.
+async function updateAnimeTitleImpl(seasonName, anime, displayTitle) {
+	const sheets = await getSheetsClient();
+	const animeLoc = await findAnimeColumn(sheets, seasonName, anime);
+	if (!animeLoc) return false;
+
+	const titleRow = animeLoc.userStart - 1;
+	await sheets.spreadsheets.values.update({
+		spreadsheetId: hojaActual(),
+		range: `'${seasonName}'!${columnLetter(animeLoc.col)}${titleRow}`,
+		valueInputOption: 'USER_ENTERED',
+		requestBody: { values: [[anime.url ? `=HYPERLINK("${anime.url}"; "${displayTitle.replace(/"/g, "'")}")` : displayTitle]] },
 	});
 	return true;
 }
@@ -1325,7 +1464,7 @@ async function updateAnimeImageImpl(seasonName, anime, imageUrl) {
 
 	const imageRow = animeLoc.userStart - 1 - IMAGE_ROW_SPAN;
 	await sheets.spreadsheets.values.update({
-		spreadsheetId: SPREADSHEET_ID,
+		spreadsheetId: hojaActual(),
 		range: `'${seasonName}'!${columnLetter(animeLoc.col)}${imageRow}`,
 		valueInputOption: 'USER_ENTERED',
 		requestBody: { values: [[imageUrl ? `=IMAGE("${imageUrl}"; 1)` : '']] },
@@ -1348,14 +1487,14 @@ async function clearVoteImpl(seasonName, username, anime) {
 	const rowIndex = animeLoc.userStart + userIndex;
 
 	await sheets.spreadsheets.values.update({
-		spreadsheetId: SPREADSHEET_ID,
+		spreadsheetId: hojaActual(),
 		range: `'${seasonName}'!${columnLetter(animeLoc.col)}${rowIndex}`,
 		valueInputOption: 'RAW',
 		requestBody: { values: [['']] },
 	});
 
 	await sheets.spreadsheets.batchUpdate({
-		spreadsheetId: SPREADSHEET_ID,
+		spreadsheetId: hojaActual(),
 		requestBody: {
 			requests: [
 				{
@@ -1490,19 +1629,30 @@ async function relocateAnimeColumnImpl(seasonName, anime) {
 
 	const sheetId = sheet.properties.sheetId;
 
-	const [namesRes, cellsRes] = await Promise.all([
-		sheets.spreadsheets.values.get({
-			spreadsheetId: SPREADSHEET_ID,
-			range: `'${seasonName}'!${columnLetter(NAME_COL_INDEX)}${current.userStart}:${columnLetter(NAME_COL_INDEX)}${current.dayRowIndex - 1}`,
-		}),
-		sheets.spreadsheets.get({
-			spreadsheetId: SPREADSHEET_ID,
-			ranges: [`'${seasonName}'!${columnLetter(current.col)}${current.userStart}:${columnLetter(current.col)}${current.dayRowIndex - 1}`],
-			fields: 'sheets.data.rowData.values(formattedValue,userEnteredFormat.backgroundColor)',
-		}),
-	]);
-	const names = namesRes.data.values?.map((row) => row[0] ?? '') ?? [];
-	const cellRows = cellsRes.data.sheets?.[0]?.data?.[0]?.rowData ?? [];
+	// 🐛 Si el bloque de origen se quedó sin NINGUNA fila de usuario (ej. la única persona que lo
+	// veía acaba de borrarse con deleteUserRow, ver /quitar-usuario), userStart === dayRowIndex y el
+	// rango de abajo queda invertido (p. ej. "A8:A7"). La API de Sheets NO lo trata como vacío: lo
+	// normaliza sola a "A7:A8" y devuelve la fila de CABECERA ("Nombre") como si fuera una persona
+	// más con voto — comprobado en vivo. Sin esta guarda, esa fila fantasma se "llevaba" al bloque
+	// destino con el propio texto del título del anime como si fuera su valor de voto (bug real,
+	// visto 2026-10-04: una fila "Nombre" duplicada en ABANDONADOS). No hay nada que cargar cuando
+	// no hay filas de usuario, así que se salta la lectura entera.
+	const hayFilasDeUsuario = current.dayRowIndex - 1 >= current.userStart;
+	const [namesRes, cellsRes] = hayFilasDeUsuario
+		? await Promise.all([
+				sheets.spreadsheets.values.get({
+					spreadsheetId: hojaActual(),
+					range: `'${seasonName}'!${columnLetter(NAME_COL_INDEX)}${current.userStart}:${columnLetter(NAME_COL_INDEX)}${current.dayRowIndex - 1}`,
+				}),
+				sheets.spreadsheets.get({
+					spreadsheetId: hojaActual(),
+					ranges: [`'${seasonName}'!${columnLetter(current.col)}${current.userStart}:${columnLetter(current.col)}${current.dayRowIndex - 1}`],
+					fields: 'sheets.data.rowData.values(formattedValue,userEnteredFormat.backgroundColor)',
+				}),
+			])
+		: [null, null];
+	const names = namesRes?.data.values?.map((row) => row[0] ?? '') ?? [];
+	const cellRows = cellsRes?.data.sheets?.[0]?.data?.[0]?.rowData ?? [];
 	const carried = names
 		.map((name, i) => ({
 			name,
@@ -1520,7 +1670,7 @@ async function relocateAnimeColumnImpl(seasonName, anime) {
 	for (const entry of carried) {
 		const rowIndex = await ensureUserRowImpl(seasonName, entry.name, newUserStart);
 		await sheets.spreadsheets.values.update({
-			spreadsheetId: SPREADSHEET_ID,
+			spreadsheetId: hojaActual(),
 			range: `'${seasonName}'!${columnLetter(newCol)}${rowIndex}`,
 			valueInputOption: 'USER_ENTERED',
 			requestBody: { values: [[entry.value]] },
@@ -1545,10 +1695,75 @@ async function relocateAnimeColumnImpl(seasonName, anime) {
 				},
 			},
 		];
-		await sheets.spreadsheets.batchUpdate({ spreadsheetId: SPREADSHEET_ID, requestBody: { requests } });
+		await sheets.spreadsheets.batchUpdate({ spreadsheetId: hojaActual(), requestBody: { requests } });
 	}
 
 	invalidateColumnCache(seasonName);
+}
+
+// Recorre TODAS las pestañas de la spreadsheet (de la más nueva a la más vieja, por índice) buscando
+// animes cuyo texto de título no coincide con el link a MyAnimeList que llevan — eso pasa cuando
+// alguien le escribió un apodo a mano encima del título real, de las tantas veces que se hizo así antes
+// de que existiera /apodo. Devuelve un Map malId -> texto mostrado (uno solo por malId: si aparece
+// distinto en más de una pestaña, se queda con el de la pestaña más reciente en la que aparece). Es de
+// solo lectura, no escribe nada — /apodos-importar decide qué hacer con el resultado.
+async function findNicknameCandidates() {
+	const sheets = await getSheetsClient();
+	const meta = await sheets.spreadsheets.get({ spreadsheetId: hojaActual() });
+	const sortedTabs = [...meta.data.sheets].sort((a, b) => a.properties.index - b.properties.index);
+
+	const found = new Map();
+	for (const tab of sortedTabs) {
+		const title = tab.properties.title;
+		const rowCount = Math.min(tab.properties.gridProperties.rowCount, 400);
+		const colCount = tab.properties.gridProperties.columnCount;
+		let rows;
+		try {
+			const res = await sheets.spreadsheets.get({
+				spreadsheetId: hojaActual(),
+				ranges: [`'${title}'!A1:${columnLetter(colCount - 1)}${rowCount}`],
+				fields: 'sheets.data.rowData.values(formattedValue,hyperlink,userEnteredValue.formulaValue,textFormatRuns.format.link.uri)',
+			});
+			rows = res.data.sheets?.[0]?.data?.[0]?.rowData ?? [];
+		} catch (err) {
+			console.error(`[apodos-importar] no pude leer "${title}":`, err.message);
+			continue;
+		}
+
+		for (const row of rows) {
+			for (const cell of row.values ?? []) {
+				const runLinks = (cell.textFormatRuns ?? []).map((r) => r.format?.link?.uri).filter(Boolean);
+				const sources = [cell.hyperlink, cell.userEnteredValue?.formulaValue, ...runLinks].filter(Boolean);
+				const match = sources.map((s) => /myanimelist\.net\/anime\/(\d+)/.exec(s)).find(Boolean);
+				if (!match) continue;
+
+				const malId = Number(match[1]);
+				const displayedTitle = (cell.formattedValue ?? '').trim();
+				if (!displayedTitle || found.has(malId)) continue;
+				found.set(malId, displayedTitle);
+			}
+		}
+
+		// Throttle chico entre pestañas: leer 20+ pestañas seguidas puede pegarle a la cuota de lecturas
+		// por minuto de la API de Sheets (ya nos pasó en otras operaciones masivas de esta sesión).
+		await new Promise((resolve) => setTimeout(resolve, 1500));
+	}
+
+	return found;
+}
+
+// Para /limpiar-nombre-hoja: nombres de TODAS las pestañas de temporada de la spreadsheet, de la más
+// nueva a la más vieja (por índice). Excluye "Base formato" (la plantilla, no una temporada real —
+// ver memoria sheet_ids.md) — el resto se asume temporada aunque no se valide su estructura acá; si
+// alguna pestaña rara no tiene el layout esperado, deleteUserRowImpl ya lo maneja: getUsersAndDayRow
+// lanza y el caller debe atraparlo por pestaña, no dejar que tumbe el resto del recorrido.
+async function listSeasonTabs() {
+	const sheets = await getSheetsClient();
+	const meta = await sheets.spreadsheets.get({ spreadsheetId: hojaActual(), fields: 'sheets.properties' });
+	return meta.data.sheets
+		.filter((s) => s.properties.title.trim().toLowerCase() !== 'base formato')
+		.sort((a, b) => b.properties.index - a.properties.index)
+		.map((s) => s.properties.title);
 }
 
 // Wrappers públicos: encolan por temporada para que dos llamadas concurrentes (p. ej. dos votos casi
@@ -1556,6 +1771,17 @@ async function relocateAnimeColumnImpl(seasonName, anime) {
 // (*Impl) se llaman directo entre sí (sin pasar por la cola) para no auto-bloquearse.
 function ensureSeasonTab(seasonName) {
 	return enqueue(seasonName, () => ensureSeasonTabImpl(seasonName));
+}
+
+// Nombre real de la pestaña si ya existe (para Google es la misma aunque difieran las mayúsculas), o el
+// que se pasó si no existe ninguna. Lo necesita quien borra y recrea una pestaña: hacerlo con una variante
+// de mayúsculas distinta borraría la pestaña real y dejaría una nueva vacía.
+function canonicalSeasonTabName(seasonName) {
+	return enqueue(seasonName, async () => {
+		const sheets = await getSheetsClient();
+		const sheet = await findSheetByTitle(sheets, seasonName);
+		return sheet ? sheet.properties.title : seasonName;
+	});
 }
 
 function ensureAnimeColumn(seasonName, anime) {
@@ -1567,11 +1793,14 @@ function ensureUserRow(seasonName, username, userStart) {
 }
 
 function setVote(seasonName, username, anime, voteType, episodesWatched = 0, caughtUpThisWeek = false) {
-	return enqueue(seasonName, () => setVoteImpl(seasonName, username, anime, voteType, episodesWatched, caughtUpThisWeek));
+	// setVoteImpl se puede repetir sin efectos dobles (busca la columna y la fila que ya existen antes de
+	// escribir), así que ante la cuota de Google espera y reintenta dentro del mismo turno de la cola.
+	return enqueue(seasonName, () => conReintentoDeCuota(() => setVoteImpl(seasonName, username, anime, voteType, episodesWatched, caughtUpThisWeek)));
 }
 
 function clearVote(seasonName, username, anime) {
-	return enqueue(seasonName, () => clearVoteImpl(seasonName, username, anime));
+	// Igual que setVote: lee y después escribe la misma celda, así que repetirlo es seguro.
+	return enqueue(seasonName, () => conReintentoDeCuota(() => clearVoteImpl(seasonName, username, anime)));
 }
 
 function relocateAnimeColumn(seasonName, anime) {
@@ -1586,6 +1815,10 @@ function updateAnimeImage(seasonName, anime, imageUrl) {
 	return enqueue(seasonName, () => updateAnimeImageImpl(seasonName, anime, imageUrl));
 }
 
+function updateAnimeTitle(seasonName, anime, displayTitle) {
+	return enqueue(seasonName, () => updateAnimeTitleImpl(seasonName, anime, displayTitle));
+}
+
 function repairSeasonTab(seasonName) {
 	return enqueue(seasonName, () => repairSeasonTabImpl(seasonName));
 }
@@ -1594,15 +1827,26 @@ function deleteSeasonTab(seasonName) {
 	return enqueue(seasonName, () => deleteSeasonTabImpl(seasonName));
 }
 
+function deleteUserRow(seasonName, username) {
+	// Lee y luego borra por nombre: repetirlo si una reintento de cuota lo dispara dos veces es
+	// seguro (la segunda vez simplemente no encuentra el nombre y no hace nada).
+	return enqueue(seasonName, () => conReintentoDeCuota(() => deleteUserRowImpl(seasonName, username)));
+}
+
 module.exports = {
 	ensureSeasonTab,
+	canonicalSeasonTabName,
 	ensureAnimeColumn,
 	ensureUserRow,
+	deleteUserRow,
+	listSeasonTabs,
 	setVote,
 	clearVote,
 	relocateAnimeColumn,
 	updateAnimeDay,
 	updateAnimeImage,
+	updateAnimeTitle,
 	repairSeasonTab,
 	deleteSeasonTab,
+	findNicknameCandidates,
 };

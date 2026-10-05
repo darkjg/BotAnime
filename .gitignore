@@ -10,3 +10,7 @@ botanime-d57bcf25e781.json
 *.db
 botanime.json
 seasonCache.json
+
+# No exponer la conexión con Aurora en el repo público (sincroniza gifs de reacción, ver /reaccion)
+src/commands/reaccion.js
+src/services/auroraSync.js

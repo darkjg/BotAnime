@@ -2,6 +2,7 @@ const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
 const { repairSeasonTab } = require('../services/sheets');
 const { getAnimeForSeason } = require('../services/db');
 const { autoCleanupReply } = require('../ephemeral');
+const { autocompleteTemporada } = require('../seasonAutocomplete');
 
 const data = new SlashCommandBuilder()
 	.setName('temporada-reparar')
@@ -9,7 +10,8 @@ const data = new SlashCommandBuilder()
 	.addStringOption((option) =>
 		option
 			.setName('nombre')
-			.setDescription('Nombre exacto de la pestaña de la sheet a reparar, ej: "Verano 2026"')
+			.setDescription('Temporada (pestaña de la sheet) a reparar: elígela de la lista')
+			.setAutocomplete(true)
 			.setRequired(true),
 	)
 	.setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild);
@@ -84,4 +86,4 @@ async function execute(interaction) {
 	autoCleanupReply(interaction);
 }
 
-module.exports = { data, execute };
+module.exports = { data, execute, autocomplete: autocompleteTemporada };

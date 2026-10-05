@@ -1,6 +1,6 @@
 const { ActionRowBuilder, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
 const { getTrailers, hasPrequel } = require('./services/jikan');
-const { setVote, clearVote, relocateAnimeColumn } = require('./services/sheets');
+const { relocateAnimeColumn } = require('./services/sheets');
 const {
 	recordVote,
 	removeVote,
@@ -13,19 +13,21 @@ const {
 	addEpisodesWatched,
 	getEpisodesWatched,
 	getWatchersWithProgress,
-	isCaughtUpThisWeek,
 	getAnimeAcrossGuilds,
+	getDisplayTitle,
 } = require('./services/db');
 const { getAnime, rememberAnime, getSeasonLabel } = require('./seasonCache');
 const { handleSeasonSelect, handleSeasonConfirm } = require('./commands/temporadaShared');
 const { handleSelect: handleEnComunSelect, handlePageButton: handleEnComunPageButton } = require('./commands/enComun');
-const { handleSelect: handlePendientesSelect, handleSoloButton: handlePendientesSoloButton } = require('./commands/pendientes');
+const { handleSelect: handlePendientesSelect, handleSoloButton: handlePendientesSoloButton, handlePageButton: handlePendientesPageButton } = require('./commands/pendientes');
+const { handleCancelButton: handleReminderCancelButton } = require('./commands/recordatorio');
+const { handleQuedadaPersonasSelect, handleQuedadaCrearModal } = require('./commands/quedada');
 const { buildAnimeEmbed, buildVoteRow } = require('./components');
 const { autoCleanupReply } = require('./ephemeral');
-
-// Discord no permite filtrar por rol un UserSelectMenu (solo existe para Role Select), así que el
-// filtro se aplica después de elegir: a "Actualizar capítulo" solo pueden entrar quienes tengan este rol.
-const EPISODE_UPDATE_ROLE_ID = '1508943288311480370';
+const { reabrirSiArchivado } = require('./threadUtil');
+const { refrescarCeldaDeProgreso, limpiarCeldaDeVoto, motivoFalloSheet, textoFallosSheet } = require('./sheetProgress');
+const { esErrorDeCuota } = require('./services/reintento');
+const { handleAv1WarpButton } = require('./av1Backup');
 
 // Si tras un voto (o deshacerlo) ya no queda nadie viendo un anime, se marca automáticamente como
 // "abandonado" y se reubica su columna a esa sección de la sheet; si alguien vuelve a votar verde/
@@ -43,7 +45,7 @@ async function syncAbandonedState(seasonLabel, malId, animeTitle) {
 	const [registro] = getAnimeAcrossGuilds({ seasonLabel, malId });
 	if (!registro) return;
 	try {
-		await relocateAnimeColumn(seasonLabel, registro);
+		await relocateAnimeColumn(seasonLabel, { ...registro, title: getDisplayTitle(registro) });
 		console.log(`[interactions] "${animeTitle}" ${shouldBeAbandoned ? 'marcado como abandonado' : 'ya no está abandonado'}, columna reubicada`);
 	} catch (err) {
 		console.error(`[interactions] no pude reubicar "${animeTitle}" (abandonado=${shouldBeAbandoned}):`, err.message);
@@ -85,11 +87,21 @@ async function handleVoteButton(interaction, voteType, seasonSlug, malId) {
 		voteType === 'rojo' ? anime : { ...anime, isSequel: anime.isSequel || (await hasPrequel(anime.malId)) };
 	if (voteType !== 'rojo') rememberAnime(animeForSheet);
 	const episodesWatched = getEpisodesWatched({ seasonLabel, malId: anime.malId, discordId: interaction.member.id });
-	// El voto/progreso es un solo hecho real, no depende del guild desde el que se votó: se escribe en
-	// la sheet de cada guild que tenga este anime registrado (ver getAnimeAcrossGuilds).
-	for (const registro of getAnimeAcrossGuilds({ seasonLabel, malId: anime.malId })) {
-		const caughtUpThisWeek = isCaughtUpThisWeek({ seasonLabel, malId: anime.malId, guildId: registro.guildId, episodesWatched });
-		await setVote(seasonLabel, username, { ...registro, isSequel: animeForSheet.isSequel }, voteType, episodesWatched, caughtUpThisWeek);
+	// La sheet es una sola: el voto se escribe una vez (ver sheetProgress.js). Si falla (cuota de Google tras los
+	// reintentos u otro error) no se guarda nada y se avisa, así la base y la sheet no quedan distintas.
+	const escrito = await refrescarCeldaDeProgreso({
+		seasonLabel,
+		malId: anime.malId,
+		displayName: username,
+		voteType,
+		episodesWatched,
+		extra: { isSequel: animeForSheet.isSequel },
+	});
+	if (!escrito.ok) {
+		console.error(`[interactions] no pude escribir el voto de "${username}" para "${anime.title}" en la sheet:`, escrito.error.message);
+		await interaction.editReply(`No pude guardar tu voto: ${motivoFalloSheet(escrito.error)}. Probá de nuevo en un minuto.`);
+		autoCleanupReply(interaction);
+		return;
 	}
 
 	if (voteType === 'rojo') {
@@ -117,6 +129,7 @@ async function handleVoteButton(interaction, voteType, seasonSlug, malId) {
 	const voteState = getVoteState({ seasonLabel, malId: anime.malId });
 	const progress = getWatchersWithProgress({ seasonLabel, malId: anime.malId });
 	try {
+		await reabrirSiArchivado(interaction.channel);
 		await interaction.message.edit({
 			embeds: [buildAnimeEmbed(animeForSheet, { voteState, progress })],
 			components: buildVoteRow(seasonLabel, anime.malId, { voteState }),
@@ -127,7 +140,8 @@ async function handleVoteButton(interaction, voteType, seasonSlug, malId) {
 
 	console.log(`[interactions] voto "${voteType}" de ${username} para "${anime.title}" (${seasonLabel})`);
 
-	const confirmation = voteType === 'rojo' ? `Anotado: no verás **${anime.title}**.` : `Tu voto para **${anime.title}** se guardó.`;
+	const displayTitle = getDisplayTitle(anime);
+	const confirmation = voteType === 'rojo' ? `Anotado: no verás **${displayTitle}**.` : `Tu voto para **${displayTitle}** se guardó.`;
 	await interaction.editReply(confirmation);
 
 	setTimeout(() => {
@@ -157,13 +171,15 @@ async function handleUndoVoteButton(interaction, seasonSlug, malId) {
 	await interaction.deferReply({ ephemeral: true });
 
 	const username = interaction.member.displayName;
-	// Igual que al votar: deshacer el voto es un solo hecho real, se limpia en la sheet de cada guild
-	// que tenga este anime registrado.
-	let cleared = false;
-	for (const registro of getAnimeAcrossGuilds({ seasonLabel, malId: anime.malId })) {
-		const clearedAqui = await clearVote(seasonLabel, username, registro);
-		cleared = cleared || clearedAqui;
+	// Igual que al votar: la sheet es una sola, se limpia una vez. Si falla, el voto no se borra de la base.
+	const limpio = await limpiarCeldaDeVoto({ seasonLabel, malId: anime.malId, displayName: username });
+	if (!limpio.ok) {
+		console.error(`[interactions] no pude limpiar el voto de "${username}" para "${anime.title}" en la sheet:`, limpio.error.message);
+		await interaction.editReply(`No pude borrar tu voto: ${motivoFalloSheet(limpio.error)}. Probá de nuevo en un minuto.`);
+		autoCleanupReply(interaction);
+		return;
 	}
+	const cleared = limpio.cleared;
 	removeVote({ seasonLabel, malId: anime.malId, discordId: interaction.member.id });
 
 	await syncAbandonedState(seasonLabel, anime.malId, anime.title);
@@ -171,6 +187,7 @@ async function handleUndoVoteButton(interaction, seasonSlug, malId) {
 	const voteState = getVoteState({ seasonLabel, malId: anime.malId });
 	const progress = getWatchersWithProgress({ seasonLabel, malId: anime.malId });
 	try {
+		await reabrirSiArchivado(interaction.channel);
 		await interaction.message.edit({
 			embeds: [buildAnimeEmbed(anime, { voteState, progress })],
 			components: buildVoteRow(seasonLabel, anime.malId, { voteState }),
@@ -181,9 +198,8 @@ async function handleUndoVoteButton(interaction, seasonSlug, malId) {
 
 	console.log(`[interactions] deshacer voto de ${username} para "${anime.title}" (${seasonLabel}): ${cleared ? 'borrado' : 'no había voto'}`);
 
-	const confirmation = cleared
-		? `Borré tu voto para **${anime.title}**.`
-		: `No tenías un voto guardado para **${anime.title}**.`;
+	const displayTitle = getDisplayTitle(anime);
+	const confirmation = cleared ? `Borré tu voto para **${displayTitle}**.` : `No tenías un voto guardado para **${displayTitle}**.`;
 	await interaction.editReply(confirmation);
 
 	setTimeout(() => {
@@ -217,9 +233,9 @@ async function handleEpisodePickButton(interaction, seasonSlug, malId) {
 
 	// El selector nativo de usuarios de Discord (UserSelectMenu) busca sobre la lista de miembros que
 	// el cliente de Discord tiene cargada, y en servidores grandes no siempre encuentra a todos por
-	// nombre; además no se puede restringir por rol. Por eso se arma un StringSelectMenu a mano listando
-	// directamente (desde la caché del bot) a quienes tienen el rol, así siempre aparecen y quedan
-	// automáticamente filtrados.
+	// nombre. Por eso se arma un StringSelectMenu a mano listando directamente (desde la caché del bot)
+	// a quienes tienen voto verde/naranja en ESTE anime (getWatchers ya excluye voto rojo y a quien no
+	// votó): no tiene sentido ofrecer actualizar el capítulo de alguien que no lo va a ver.
 	if (interaction.guild.members.cache.size < interaction.guild.memberCount) {
 		try {
 			await interaction.guild.members.fetch();
@@ -227,13 +243,14 @@ async function handleEpisodePickButton(interaction, seasonSlug, malId) {
 			console.error('[interactions] no pude refrescar la lista de miembros para el selector de capítulo:', err.message);
 		}
 	}
+	const watcherIds = new Set(getWatchers({ seasonLabel, malId: anime.malId }));
 	const eligible = interaction.guild.members.cache
-		.filter((member) => member.roles.cache.has(EPISODE_UPDATE_ROLE_ID))
+		.filter((member) => watcherIds.has(member.id))
 		.map((member) => ({ id: member.id, displayName: member.displayName }))
 		.sort((a, b) => a.displayName.localeCompare(b.displayName));
 
 	if (eligible.length === 0) {
-		await interaction.reply({ content: 'Nadie en el servidor tiene el rol necesario para actualizar capítulos.', ephemeral: true });
+		await interaction.reply({ content: 'Nadie está votando este anime todavía, no hay a quién actualizarle el capítulo.', ephemeral: true });
 		autoCleanupReply(interaction);
 		return;
 	}
@@ -245,7 +262,7 @@ async function handleEpisodePickButton(interaction, seasonSlug, malId) {
 	interaction.client.episodeFlowCache.set(token, {
 		seasonLabel,
 		malId: anime.malId,
-		animeTitle: anime.title,
+		animeTitle: getDisplayTitle(anime),
 		channelId: interaction.channelId,
 		messageId: interaction.message.id,
 	});
@@ -261,7 +278,7 @@ async function handleEpisodePickButton(interaction, seasonSlug, malId) {
 		.addOptions(eligible.slice(0, 25).map((u) => ({ label: u.displayName, value: u.id })));
 
 	await interaction.reply({
-		content: `¿A quién le actualizamos el capítulo de **${anime.title}**?${truncated ? ' (mostrando los primeros 25 con el rol)' : ''}`,
+		content: `¿A quién le actualizamos el capítulo de **${getDisplayTitle(anime)}**?${truncated ? ' (mostrando los primeros 25 con el rol)' : ''}`,
 		components: [new ActionRowBuilder().addComponents(select)],
 		ephemeral: true,
 	});
@@ -275,19 +292,20 @@ async function handleEpisodeUsersSelect(interaction, token) {
 		return;
 	}
 
-	// El selector ya solo ofrecía gente con el rol; este re-chequeo es solo por si a alguien se lo
-	// sacaron justo entre que se abrió el selector y se envió la elección.
+	// El selector ya solo ofrecía a quienes votaban este anime; este re-chequeo es solo por si alguien
+	// quitó su voto (o votó rojo) justo entre que se abrió el selector y se envió la elección.
+	const watcherIds = new Set(getWatchers({ seasonLabel: cached.seasonLabel, malId: cached.malId }));
 	const selected = interaction.values.map((id) => {
 		const member = interaction.guild.members.cache.get(id);
-		return { id, displayName: member?.displayName ?? id, hasRole: member?.roles.cache.has(EPISODE_UPDATE_ROLE_ID) ?? false };
+		return { id, displayName: member?.displayName ?? id, isWatching: watcherIds.has(id) };
 	});
 
-	const withoutRole = selected.filter((u) => !u.hasRole);
-	const users = selected.filter((u) => u.hasRole);
+	const withoutRole = selected.filter((u) => !u.isWatching);
+	const users = selected.filter((u) => u.isWatching);
 
 	if (users.length === 0) {
 		await interaction.update({
-			content: `Ninguno de los elegidos tiene el rol necesario, no se actualizó nada: ${withoutRole.map((u) => `**${u.displayName}**`).join(', ')}.`,
+			content: `Ninguno de los elegidos sigue votando este anime, no se actualizó nada: ${withoutRole.map((u) => `**${u.displayName}**`).join(', ')}.`,
 			components: [],
 		});
 		autoCleanupReply(interaction);
@@ -334,24 +352,30 @@ async function handleEpisodeAmountModal(interaction, token) {
 
 	const { seasonLabel, malId, animeTitle, channelId, messageId, users, withoutRole } = cached;
 	const anime = getAnime(malId);
-	// El voto/progreso es un solo hecho real: se escribe en la sheet de cada guild que tenga este
-	// anime registrado, no solo la de donde se abrió el selector.
-	const registros = getAnimeAcrossGuilds({ seasonLabel, malId });
+	// La sheet es una sola: por persona se escribe una vez (ver sheetProgress.js). Si Google sigue limitando las
+	// consultas tras los reintentos se deja de intentar con el resto (cada intento puede esperar hasta 2
+	// minutos) y se avisa: el capítulo de todos queda guardado en la base igual.
+	const fallidos = [];
+	const resultados = [];
+	let errorCuota = null;
 	for (const { id, displayName } of users) {
 		const episodesWatched = addEpisodesWatched({ seasonLabel, malId, discordId: id, displayName, delta });
+		resultados.push({ displayName, episodesWatched });
 
 		// Si ya tiene un voto puesto, la celda de la sheet queda vieja hasta que se refresque con el
 		// capítulo nuevo; si no votó (o votó rojo), no hay celda que actualizar.
 		const vote = getUserVote({ seasonLabel, malId, discordId: id });
-		if (vote && vote.voteType !== 'rojo') {
-			for (const registro of registros) {
-				const caughtUpThisWeek = isCaughtUpThisWeek({ seasonLabel, malId, guildId: registro.guildId, episodesWatched });
-				try {
-					await setVote(seasonLabel, displayName, registro, vote.voteType, episodesWatched, caughtUpThisWeek);
-				} catch (err) {
-					console.error(`[interactions] no pude refrescar la celda de "${displayName}" en la sheet (guild ${registro.guildId}):`, err.message);
-				}
-			}
+		if (!vote || vote.voteType === 'rojo') continue;
+		if (errorCuota) {
+			fallidos.push({ displayName, error: errorCuota });
+			continue;
+		}
+
+		const resultado = await refrescarCeldaDeProgreso({ seasonLabel, malId, displayName, voteType: vote.voteType, episodesWatched });
+		if (!resultado.ok) {
+			console.error(`[interactions] no pude refrescar la celda de "${displayName}" en la sheet:`, resultado.error.message);
+			fallidos.push({ displayName, error: resultado.error });
+			if (esErrorDeCuota(resultado.error)) errorCuota = resultado.error;
 		}
 	}
 
@@ -364,6 +388,7 @@ async function handleEpisodeAmountModal(interaction, token) {
 
 	try {
 		const channel = await interaction.client.channels.fetch(channelId);
+		await reabrirSiArchivado(channel);
 		const message = await channel.messages.fetch(messageId);
 		await message.edit({
 			embeds: [buildAnimeEmbed(anime, { voteState, progress })],
@@ -373,10 +398,12 @@ async function handleEpisodeAmountModal(interaction, token) {
 		console.error('[interactions] no pude actualizar el mensaje del hilo tras actualizar el capítulo:', err.message);
 	}
 
-	const names = users.map((u) => `**${u.displayName}**`).join(', ');
+	// Cada quien puede venir de un capítulo distinto, así que el mismo "+1" les deja un número final
+	// diferente: se muestra el capítulo al que quedó cada uno, no solo cuánto se sumó.
+	const names = resultados.map((r) => `**${r.displayName}** (cap. ${r.episodesWatched})`).join(', ');
 	const skippedNote =
-		withoutRole?.length > 0 ? ` (sin actualizar por no tener el rol: ${withoutRole.map((u) => `**${u.displayName}**`).join(', ')})` : '';
-	await interaction.editReply(`Listo: ${delta > 0 ? '+' : ''}${delta} capítulo(s) para ${names} en **${animeTitle}**.${skippedNote}`);
+		withoutRole?.length > 0 ? ` (sin actualizar por ya no votar este anime: ${withoutRole.map((u) => `**${u.displayName}**`).join(', ')})` : '';
+	await interaction.editReply(`Listo: ${delta > 0 ? '+' : ''}${delta} capítulo(s) para ${names} en **${animeTitle}**.${skippedNote}${textoFallosSheet(fallidos)}`);
 	autoCleanupReply(interaction);
 }
 
@@ -385,8 +412,10 @@ async function handleTrailerButton(interaction, malId) {
 	const anime = getAnime(Number(malId));
 	const trailers = await getTrailers(Number(malId));
 
+	const animeDisplayTitle = anime ? getDisplayTitle(anime) : null;
+
 	if (trailers.length === 0) {
-		await interaction.editReply(`No hay trailer disponible para **${anime?.title ?? 'este anime'}**.`);
+		await interaction.editReply(`No hay trailer disponible para **${animeDisplayTitle ?? 'este anime'}**.`);
 		autoCleanupReply(interaction);
 		return;
 	}
@@ -411,7 +440,7 @@ async function handleTrailerButton(interaction, malId) {
 	interaction.client.trailerCache.set(malId, trailers);
 
 	await interaction.editReply({
-		content: `**${anime?.title ?? 'Anime'}** tiene varios trailers, elige uno:`,
+		content: `**${animeDisplayTitle ?? 'Anime'}** tiene varios trailers, elige uno:`,
 		components: [new ActionRowBuilder().addComponents(select)],
 	});
 }
@@ -458,6 +487,13 @@ async function handleInteraction(interaction) {
 		} else if (kind === 'encomunpage') {
 			const [token, pageIndex] = rest;
 			await handleEnComunPageButton(interaction, token, pageIndex);
+		} else if (kind === 'pendientespage') {
+			const [token, pageIndex] = rest;
+			await handlePendientesPageButton(interaction, token, pageIndex);
+		} else if (kind === 'av1warp') {
+			await handleAv1WarpButton(interaction, rest[0]);
+		} else if (kind === 'remindercancel') {
+			await handleReminderCancelButton(interaction, rest[0]);
 		}
 		return;
 	}
@@ -476,6 +512,9 @@ async function handleInteraction(interaction) {
 			await handleEnComunSelect(interaction);
 		} else if (interaction.customId === 'pendientes') {
 			await handlePendientesSelect(interaction);
+		} else if (interaction.customId.startsWith('quedadapersonas:')) {
+			const token = interaction.customId.split(':')[1];
+			await handleQuedadaPersonasSelect(interaction, token);
 		}
 		return;
 	}
@@ -484,8 +523,11 @@ async function handleInteraction(interaction) {
 		if (interaction.customId.startsWith('episodeamount:')) {
 			const token = interaction.customId.split(':')[1];
 			await handleEpisodeAmountModal(interaction, token);
+		} else if (interaction.customId.startsWith('quedadacrear:')) {
+			const token = interaction.customId.split(':')[1];
+			await handleQuedadaCrearModal(interaction, token);
 		}
 	}
 }
 
-module.exports = { handleInteraction };
+module.exports = { handleInteraction, syncAbandonedState };

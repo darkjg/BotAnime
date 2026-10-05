@@ -8,10 +8,12 @@ const {
 	setLastNotifiedAv1Episode,
 	upsertAnime,
 	getWatchers,
+	getDisplayTitle,
 } = require('../services/db');
 const { getDownloadLinks, findSlugByTitle } = require('../services/animeav1');
 const { findEraiMagnet } = require('../services/nyaa');
 const { autoCleanupReply } = require('../ephemeral');
+const { reabrirSiArchivado } = require('../threadUtil');
 
 function withTimeout(ms, promise, errMsg) {
 	return new Promise((resolve, reject) => {
@@ -174,7 +176,7 @@ async function execute(interaction) {
 
 			const lastNotified = forzar ? 0 : getLastNotifiedAv1Episode({ seasonLabel: anime.seasonLabel, malId: anime.malId, guildId: anime.guildId });
 			const startFrom = Math.max(1, lastNotified + 1);
-			await interaction.editReply(`Procesando **${anime.title}**...`);
+			await interaction.editReply(`Procesando **${getDisplayTitle(anime)}**...`);
 
 			const lastEpisode = await findLastEpisodeNumber(slug, startFrom);
 			if (!lastEpisode || startFrom > lastEpisode) {
@@ -184,6 +186,7 @@ async function execute(interaction) {
 			}
 
 			const thread = await interaction.client.channels.fetch(threadId);
+			await reabrirSiArchivado(thread);
 			if (forzar) await clearThreadReplies(thread);
 			for (let ep = startFrom; ep <= lastEpisode; ep += 1) {
 				// Otra corrida de /recarga (o el chequeo automático de cada 30min) puede haber reclamado

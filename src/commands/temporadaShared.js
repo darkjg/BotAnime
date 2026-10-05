@@ -7,6 +7,7 @@ const {
 	ChannelType,
 	ForumLayoutType,
 	MessageFlags,
+	ThreadAutoArchiveDuration,
 } = require('discord.js');
 const { getSeasonAnime, getAnimeById } = require('../services/jikan');
 const { ensureSeasonTab, ensureAnimeColumn, setVote } = require('../services/sheets');
@@ -15,7 +16,12 @@ const {
 	getVoteState,
 	getForumChannel,
 	setForumChannel,
+	getSeasonForum,
+	setSeasonForum,
+	getBotState,
+	setBotState,
 	setAv1ForumThread,
+	getAv1ForumThread,
 	setLastNotifiedAv1Episode,
 	setActiveSeason,
 	getActiveSeason,
@@ -28,6 +34,7 @@ const {
 	recordVote,
 	getEpisodesWatched,
 	setEpisodesWatched,
+	getDisplayTitle,
 } = require('../services/db');
 const { defaultSeasonLabel, slugForCustomId, JIKAN_SEASON_TO_ES, seasonAtOffset } = require('../seasonLabel');
 const { rememberAnime, rememberSeasonLabel } = require('../seasonCache');
@@ -158,8 +165,11 @@ async function prepareSeason({ guildId, year, season, nombreOverride }) {
 	console.log(`[temporada] Jikan devolvió ${anime.length} animes para ${season} ${year}`);
 	if (anime.length === 0) return null;
 
-	const seasonLabel = nombreOverride ?? defaultSeasonLabel(anime[0]);
-	await ensureSeasonTab(seasonLabel);
+	// ensureSeasonTab devuelve el nombre REAL de la pestaña: si ya existía con otras mayúsculas (p. ej. se
+	// escribió "otoño 2026" a mano en `nombre` y la pestaña es "Otoño 2026") se adopta el de la pestaña. Para
+	// Google son la misma, así que crearla fallaría; y la base indexa votos, hilos y progreso por
+	// seasonLabel, así que seguir con la variante escrita crearía una temporada paralela vacía.
+	const seasonLabel = await ensureSeasonTab(nombreOverride ?? defaultSeasonLabel(anime[0]));
 	anime.forEach(rememberAnime);
 	const seasonSlug = slugForCustomId(seasonLabel);
 	rememberSeasonLabel(seasonSlug, seasonLabel);
@@ -185,7 +195,7 @@ async function prepareSeason({ guildId, year, season, nombreOverride }) {
 		});
 	}
 
-	const carryoverCount = await addCarryoverAnime(seasonLabel, anime, guildId);
+	const carryoverCount = await addCarryoverAnime(seasonLabel, anime, guildId, inicioDeTemporada(year, season));
 	console.log(`[temporada] "${seasonLabel}" lista: ${anime.length} animes + ${carryoverCount} carryover`);
 
 	return { seasonLabel, anime, carryoverCount };
@@ -201,16 +211,45 @@ function isActuallyAiring(anime) {
 }
 
 // Animes que ya estaban en la temporada anterior (cualquiera que no esté marcado como abandonado) y que
-// en MAL siguen emitiéndose se agregan directo al subgrupo CONTINUAN, sin esperar a que alguien vote.
+// en MAL siguen emitiéndose Y tienen algún voto (verde/naranja) se agregan directo al subgrupo CONTINUAN.
 // El orden por día de emisión dentro de la sheet lo decide ensureAnimeColumn al insertar. "Temporada
 // anterior" sale de la base (recordSeasonHistory, ver prepareSeason) en vez de leer el orden de pestañas
 // de la Sheet.
-async function addCarryoverAnime(seasonLabel, currentSeasonAnime, guildId) {
+// Jikan deja aired.to en null mientras el anime se emite, así que "no ha terminado" no basta: un anime de 12
+// episodios que estrena en julio termina en septiembre y no debe pasar a CONTINUAN de la temporada de otoño.
+// Se estima el último episodio (semanal: estreno + (episodios - 1) semanas) y solo continúa si cae en la
+// temporada nueva o después. Sin número de episodios o sin fecha de estreno no se puede saber: continúa.
+const INICIO_TEMPORADA = { winter: [0, 1], spring: [3, 1], summer: [6, 1], fall: [9, 1] };
+
+function inicioDeTemporada(year, season) {
+	const mesDia = INICIO_TEMPORADA[season];
+	return mesDia ? new Date(Date.UTC(Number(year), mesDia[0], mesDia[1])) : null;
+}
+
+function terminaAntesDe(anime, inicio) {
+	if (!inicio) return false;
+	// AniList manda: si dice que ya terminó, o si el último episodio sale antes de la temporada nueva, no continúa.
+	const al = anime.anilist;
+	if (al) {
+		if (al.status === 'FINISHED' || al.status === 'CANCELLED') return true;
+		if (al.ultimoEpisodioMs) return al.ultimoEpisodioMs < inicio.getTime();
+	}
+	if (!anime.episodes || !anime.airedFrom) return false;
+	const ultimoEpisodio = new Date(anime.airedFrom).getTime() + (anime.episodes - 1) * 7 * 24 * 60 * 60 * 1000;
+	return ultimoEpisodio < inicio.getTime();
+}
+
+async function addCarryoverAnime(seasonLabel, currentSeasonAnime, guildId, inicio = null) {
 	const currentMalIds = new Set(currentSeasonAnime.map((a) => a.malId));
 	const previousSeasonLabel = getPreviousSeasonLabel({ guildId, seasonLabel });
+	// Solo continúan los que alguien sigue (voto verde/naranja en la temporada anterior): sin votos no hay
+	// a quién avisar ni nada que trasladar, y ahorra consultas a Jikan y a la Sheet.
+	const conVoto = previousSeasonLabel
+		? new Set(getVotesForSeason(previousSeasonLabel).filter((v) => v.voteType === 'verde' || v.voteType === 'naranja').map((v) => v.malId))
+		: new Set();
 	const previousMalIds = previousSeasonLabel
 		? getAnimeForSeason(previousSeasonLabel)
-				.filter((a) => a.guildId === guildId && !a.isAbandoned)
+				.filter((a) => a.guildId === guildId && !a.isAbandoned && conVoto.has(a.malId))
 				.map((a) => a.malId)
 		: [];
 
@@ -224,9 +263,13 @@ async function addCarryoverAnime(seasonLabel, currentSeasonAnime, guildId) {
 				console.log(`[temporada] "${fullAnime.title}" ya terminó (status: ${fullAnime.status}, fin: ${fullAnime.airedTo ?? 'desconocido'}), no va a CONTINUAN`);
 				continue;
 			}
+			if (terminaAntesDe(fullAnime, inicio)) {
+				console.log(`[temporada] "${fullAnime.title}" termina antes de que empiece la temporada nueva (${fullAnime.episodes} eps desde ${fullAnime.airedFrom?.slice(0, 10)}), no va a CONTINUAN`);
+				continue;
+			}
 			rememberAnime(fullAnime);
 			const carryoverAnime = { ...fullAnime, isCarryover: true };
-			await ensureAnimeColumn(seasonLabel, carryoverAnime);
+			await ensureAnimeColumn(seasonLabel, { ...carryoverAnime, title: getDisplayTitle(carryoverAnime) });
 			upsertAnime({
 				malId: fullAnime.malId,
 				seasonLabel,
@@ -261,7 +304,7 @@ async function carryOverVotesAndProgress(previousSeasonLabel, seasonLabel, anime
 	for (const vote of previousVotes) {
 		try {
 			const previousEpisodes = getEpisodesWatched({ seasonLabel: previousSeasonLabel, malId: anime.malId, discordId: vote.discordId });
-			await setVote(seasonLabel, vote.displayName, anime, vote.voteType, previousEpisodes);
+			await setVote(seasonLabel, vote.displayName, { ...anime, title: getDisplayTitle(anime) }, vote.voteType, previousEpisodes);
 			recordVote({ seasonLabel, malId: anime.malId, discordId: vote.discordId, displayName: vote.displayName, voteType: vote.voteType });
 			if (previousEpisodes > 0) {
 				setEpisodesWatched({
@@ -337,50 +380,110 @@ async function emptyForumChannel(forumChannel) {
 	}
 }
 
-// Busca el canal de foro ya creado para este servidor (lo recordamos en la DB local, no por
-// nombre). Si ya existe, lo reutiliza: lo vacía de hilos viejos y lo renombra si la temporada
-// cambió, en vez de borrar y recrear el canal (así se conservan permisos, webhooks, etc.). Si no
-// hay ninguno, crea uno con las etiquetas que distinguen nuevo/secuela/CONTINUAN y en vista de
-// galería.
-async function getOrCreateForumChannel(guild, seasonLabel, parentId) {
-	const stored = getForumChannel(guild.id);
-	const desiredName = forumChannelSlug(seasonLabel);
-	const desiredTopic = `Votación de ${seasonLabel}`;
+const NOMBRE_CATEGORIA_ANIMES = 'animes';
+// Los hilos (uno por anime) se ocultan solos tras 3 días sin actividad: en Discord es "Ocultar posts tras
+// inactividad" del foro, y cada hilo nuevo hereda ese tiempo. Ocultar no borra nada: un mensaje nuevo lo reabre.
+const OCULTAR_TRAS_MIN = ThreadAutoArchiveDuration.ThreeDays;
 
-	if (stored) {
-		const existing = await guild.channels.fetch(stored.channelId).catch(() => null);
-		if (existing) {
-			console.log(`[temporada-foro] reutilizando canal existente #${existing.name} para "${seasonLabel}"`);
-			await emptyForumChannel(existing);
+// La categoría donde viven los foros de todas las temporadas. Se recuerda por id (no por nombre); si alguien ya
+// creó una que se llame "animes" se reutiliza en vez de duplicarla.
+async function getOrCreateAnimesCategory(guild) {
+	const claveBd = `animesCategory:${guild.id}`;
+	const guardadaId = getBotState(claveBd);
+	const guardada = guardadaId ? await guild.channels.fetch(guardadaId).catch(() => null) : null;
+	if (guardada?.type === ChannelType.GuildCategory) return guardada;
 
-			if (existing.name !== desiredName) {
-				console.log(`[temporada-foro] renombrando #${existing.name} -> #${desiredName}`);
-				await existing.setName(desiredName).catch((err) => console.error(`[temporada-foro] no pude renombrar el canal:`, err.message));
-			}
-			if (existing.topic !== desiredTopic) {
-				await existing.setTopic(desiredTopic).catch(() => {});
-			}
-			if (existing.defaultForumLayout !== ForumLayoutType.GalleryView) {
-				await existing.setDefaultForumLayout(ForumLayoutType.GalleryView).catch(() => {});
-			}
+	const canales = await guild.channels.fetch();
+	let categoria = canales.find((c) => c?.type === ChannelType.GuildCategory && c.name.toLowerCase() === NOMBRE_CATEGORIA_ANIMES) ?? null;
+	if (!categoria) {
+		console.log(`[temporada-foro] creando la categoría "${NOMBRE_CATEGORIA_ANIMES}"...`);
+		categoria = await guild.channels.create({ name: NOMBRE_CATEGORIA_ANIMES, type: ChannelType.GuildCategory });
+	}
+	setBotState(claveBd, categoria.id);
+	return categoria;
+}
 
-			setForumChannel({ guildId: guild.id, channelId: existing.id, seasonLabel });
-			return existing;
+async function aplicarOcultado(foro) {
+	if (foro.defaultAutoArchiveDuration === OCULTAR_TRAS_MIN) return;
+	await foro
+		.setDefaultAutoArchiveDuration(OCULTAR_TRAS_MIN, 'Ocultar los hilos tras 3 días de inactividad')
+		.catch((err) => console.error(`[temporada-foro] no pude poner el ocultado a los 3 días en #${foro.name}:`, err.message));
+}
+
+// Antes había UN solo foro por servidor que se vaciaba y se renombraba en cada temporada. Si queda uno de esos
+// se conserva como el foro de SU temporada (con sus hilos) y se mueve a la categoría, en vez de borrarlo.
+async function adoptLegacyForum(guild, categoria) {
+	const legado = getForumChannel(guild.id);
+	if (!legado?.seasonLabel || getSeasonForum({ guildId: guild.id, seasonLabel: legado.seasonLabel })) return;
+	const canal = await guild.channels.fetch(legado.channelId).catch(() => null);
+	if (!canal) return;
+
+	setSeasonForum({ guildId: guild.id, seasonLabel: legado.seasonLabel, channelId: canal.id });
+	console.log(`[temporada-foro] #${canal.name} pasa a ser el foro de "${legado.seasonLabel}" y se mueve a la categoría "${categoria.name}"`);
+	if (canal.parentId !== categoria.id) {
+		await canal
+			.setParent(categoria.id, { lockPermissions: false })
+			.catch((err) => console.error(`[temporada-foro] no pude mover #${canal.name} a la categoría:`, err.message));
+	}
+	await aplicarOcultado(canal);
+}
+
+// Un foro por temporada dentro de la categoría "animes". Al publicar una temporada nueva se crea su foro y los
+// de las anteriores se conservan (con sus hilos). Volver a publicar la MISMA temporada sigue vaciando y
+// rellenando su foro, como antes. Si ya existía, se reutiliza (se renombra/reordena si hace falta) en vez de
+// borrarlo y recrearlo: así se conservan permisos, webhooks, etc.
+async function getOrCreateForumChannel(guild, seasonLabel) {
+	const categoria = await getOrCreateAnimesCategory(guild);
+	await adoptLegacyForum(guild, categoria);
+
+	const nombre = forumChannelSlug(seasonLabel);
+	const tema = `Votación de ${seasonLabel}`;
+	const guardadoId = getSeasonForum({ guildId: guild.id, seasonLabel });
+	const existente = guardadoId ? await guild.channels.fetch(guardadoId).catch(() => null) : null;
+
+	if (existente) {
+		console.log(`[temporada-foro] reutilizando el foro #${existente.name} de "${seasonLabel}"`);
+		await emptyForumChannel(existente);
+
+		if (existente.name !== nombre) {
+			console.log(`[temporada-foro] renombrando #${existente.name} -> #${nombre}`);
+			await existente.setName(nombre).catch((err) => console.error(`[temporada-foro] no pude renombrar el canal:`, err.message));
 		}
+		if (existente.topic !== tema) await existente.setTopic(tema).catch(() => {});
+		if (existente.defaultForumLayout !== ForumLayoutType.GalleryView) await existente.setDefaultForumLayout(ForumLayoutType.GalleryView).catch(() => {});
+		if (existente.parentId !== categoria.id) {
+			await existente
+				.setParent(categoria.id, { lockPermissions: false })
+				.catch((err) => console.error(`[temporada-foro] no pude mover el foro a la categoría:`, err.message));
+		}
+		await aplicarOcultado(existente);
+
+		setForumChannel({ guildId: guild.id, channelId: existente.id, seasonLabel });
+		return existente;
 	}
 
-	console.log(`[temporada-foro] creando canal de foro nuevo para "${seasonLabel}"...`);
-	const forumChannel = await guild.channels.create({
-		name: desiredName,
+	console.log(`[temporada-foro] creando el foro de "${seasonLabel}" en la categoría "${categoria.name}"...`);
+	const opciones = {
+		name: nombre,
 		type: ChannelType.GuildForum,
-		parent: parentId ?? undefined,
-		topic: desiredTopic,
+		parent: categoria.id,
+		topic: tema,
 		defaultForumLayout: ForumLayoutType.GalleryView,
 		availableTags: FORUM_TAG_NAMES.map((tagName) => ({ name: tagName })),
-	});
+	};
+	let foro;
+	try {
+		foro = await guild.channels.create({ ...opciones, defaultAutoArchiveDuration: OCULTAR_TRAS_MIN });
+	} catch (err) {
+		// Si Discord rechazara ese tiempo de inactividad para este servidor, el foro se crea igual (sin ocultado
+		// automático) y publishSeasonForum lo avisa: mejor eso que no poder publicar la temporada.
+		console.error(`[temporada-foro] no pude crear el foro con ocultado a los 3 días (${err.message}); lo creo sin eso`);
+		foro = await guild.channels.create(opciones);
+	}
 
-	setForumChannel({ guildId: guild.id, channelId: forumChannel.id, seasonLabel });
-	return forumChannel;
+	setSeasonForum({ guildId: guild.id, seasonLabel, channelId: foro.id });
+	setForumChannel({ guildId: guild.id, channelId: foro.id, seasonLabel });
+	return foro;
 }
 
 function tagIdFor(forumChannel, anime) {
@@ -393,10 +496,19 @@ function tagIdFor(forumChannel, anime) {
 // canal, sin necesidad de un mensaje único con Anterior/Siguiente.
 async function publishSeasonForum({ interaction, respond, year, season, nombreOverride, voterNames }) {
 	const guild = interaction.guild ?? (await interaction.client.guilds.fetch(interaction.guildId));
-	const commandChannel = interaction.channel ?? (await interaction.client.channels.fetch(interaction.channelId));
 
-
-	const prepared = await prepareSeason({ guildId: guild.id, year, season, nombreOverride });
+	let prepared;
+	try {
+		prepared = await prepareSeason({ guildId: guild.id, year, season, nombreOverride });
+	} catch (err) {
+		console.error('[temporada-foro] no pude preparar la temporada:', err.message);
+		const jikan = /Jikan request failed \((\d+)\)/.exec(err.message);
+		const motivo = jikan
+			? `Jikan (la API de MyAnimeList) no responde ahora mismo (error ${jikan[1]}); es un problema de esa web, no del bot`
+			: err.message;
+		await respond(`No pude preparar la temporada: ${motivo}. No se creó ningún foro; prueba de nuevo en unos minutos.`);
+		return;
+	}
 	if (!prepared) {
 		await respond('No encontré animes para esa temporada.');
 		return;
@@ -405,17 +517,42 @@ async function publishSeasonForum({ interaction, respond, year, season, nombreOv
 
 	let forumChannel;
 	try {
-		forumChannel = await getOrCreateForumChannel(guild, seasonLabel, commandChannel.parentId);
+		forumChannel = await getOrCreateForumChannel(guild, seasonLabel);
 	} catch (err) {
 		await respond(`No pude crear el canal de foro (¿tengo permiso de "Gestionar canales"?): ${err.message}`);
 		return;
 	}
 
-	const introText = `Publicando animes de **${seasonLabel}** como hilos en ${forumChannel}. Los votos se guardarán en la pestaña "${seasonLabel}" de la sheet.${carryoverNoteText(carryoverCount)}\nVan a votar: ${voterListText(voterNames)}.`;
+	// Crear el hilo es lo único no idempotente de publicar una temporada (la base y la Sheet usan
+	// upsert/ensure). Saltarse los animes que ya tienen hilo permite re-ejecutar el comando sobre una
+	// temporada ya publicada para rellenar los que falten — p. ej. los que la API no devolvió la primera
+	// vez — sin duplicar los 60+ hilos que ya estaban. Si el hilo se borró a mano el fetch falla y se
+	// vuelve a crear; los archivados/ocultos siguen existiendo, así que esos cuentan como ya creados.
+	const pendientes = [];
+	let yaTenian = 0;
+	for (const entry of anime) {
+		const threadId = getAv1ForumThread({ guildId: guild.id, seasonLabel, malId: entry.malId });
+		if (threadId && (await guild.channels.fetch(threadId).catch(() => null))) {
+			yaTenian += 1;
+			continue;
+		}
+		pendientes.push(entry);
+	}
 
-	await respond(`${introText}\n\n${progressBar(0, anime.length)}`);
+	const avisoOcultado =
+		forumChannel.defaultAutoArchiveDuration === OCULTAR_TRAS_MIN ? '' : '\n⚠️ No pude activar el ocultado de los hilos a los 3 días de inactividad: ajústalo en los ajustes del foro.';
+	const avisoSaltados = yaTenian > 0 ? `\n${yaTenian} anime(s) ya tenían su hilo: los salto y solo creo los ${pendientes.length} que faltan.` : '';
+	const introText = `Publicando animes de **${seasonLabel}** como hilos en ${forumChannel}. Los votos se guardarán en la pestaña "${seasonLabel}" de la sheet.${carryoverNoteText(carryoverCount)}\nVan a votar: ${voterListText(voterNames)}.${avisoOcultado}${avisoSaltados}`;
 
-	console.log(`[temporada-foro] canal listo: #${forumChannel.name} (${forumChannel.id}). Creando ${anime.length} hilos...`);
+	if (pendientes.length === 0) {
+		await respond(`Los ${yaTenian} animes de **${seasonLabel}** ya tienen su hilo en ${forumChannel}: no hay nada nuevo que crear.`).catch(() => {});
+		console.log(`[temporada-foro] "${seasonLabel}": nada que crear, los ${yaTenian} hilos ya existían`);
+		return;
+	}
+
+	await respond(`${introText}\n\n${progressBar(0, pendientes.length)}`);
+
+	console.log(`[temporada-foro] canal listo: #${forumChannel.name} (${forumChannel.id}). ${yaTenian} hilos ya existían; creando ${pendientes.length}...`);
 
 	// Discord ordena los posts del foro por actividad más reciente primero: el último hilo creado
 	// queda arriba. Creamos en orden inverso para que el anime más importante (anime[0], el más
@@ -423,7 +560,7 @@ async function publishSeasonForum({ interaction, respond, year, season, nombreOv
 	// paralelo (en vez de uno por uno con pausa fija) para que tarde mucho menos; dentro de una misma
 	// tanda el orden de llegada puede variar un poco, pero entre tandas se respeta.
 	let created = 0;
-	const reversed = [...anime].reverse();
+	const reversed = [...pendientes].reverse();
 	const batches = chunk(reversed, FORUM_THREAD_CONCURRENCY);
 	let lastProgressUpdateAt = 0;
 
@@ -433,7 +570,7 @@ async function publishSeasonForum({ interaction, respond, year, season, nombreOv
 			batch.map(async (entry) => {
 				const voteState = getVoteState({ seasonLabel, malId: entry.malId });
 				const thread = await forumChannel.threads.create({
-					name: entry.title.slice(0, 100),
+					name: getDisplayTitle(entry).slice(0, 100),
 					message: {
 						embeds: [buildAnimeEmbed(entry, { voteState })],
 						components: buildVoteRow(seasonLabel, entry.malId, { voteState }),
@@ -480,12 +617,15 @@ async function publishSeasonForum({ interaction, respond, year, season, nombreOv
 		await sleep(FORUM_BATCH_DELAY_MS);
 	}
 
-	await respond(`${introText}\n\n${progressBar(created, anime.length)}\n✅ Listo, ya está todo publicado.`).catch(() => {});
+	await respond(`${introText}\n\n${progressBar(created, pendientes.length)}\n✅ Listo, ya está todo publicado.`).catch(() => {});
 
-	console.log(`[temporada-foro] listo: ${created}/${anime.length} hilos creados en "${seasonLabel}"`);
+	console.log(`[temporada-foro] listo: ${created}/${pendientes.length} hilos creados en "${seasonLabel}"`);
 }
 
 module.exports = {
+	getOrCreateForumChannel,
+	terminaAntesDe,
+	inicioDeTemporada,
 	buildTemporadaCommandData,
 	runTemporadaCommand,
 	handleSeasonSelect,

@@ -6,8 +6,10 @@ const {
 	getUserVote,
 	getEpisodesWatched,
 	getLastNotifiedAv1Episode,
+	getDisplayTitle,
 } = require('../services/db');
 const { autoCleanupReply } = require('../ephemeral');
+const { paginateBlocks } = require('../pagination');
 
 const data = new SlashCommandBuilder()
 	.setName('en-comun')
@@ -90,17 +92,19 @@ function pendingText(seasonLabel, guildId, malId, discordId) {
 // Línea de una sección individual: un solo dueño, así que solo hace falta su propio pendiente.
 function individualLine(anime, seasonLabel, guildId, discordId) {
 	const pending = pendingText(seasonLabel, guildId, anime.malId, discordId);
-	return pending ? `• ${anime.title} — ${pending}` : `• ${anime.title}`;
+	const title = getDisplayTitle(anime);
+	return pending ? `• ${title} — ${pending}` : `• ${title}`;
 }
 
 // Línea de la sección "en común": lo ve todo el grupo, pero cada quien puede ir por un capítulo
 // distinto. En vez de repetir el nombre de cada persona en la línea, se muestra el pendiente del más
 // atrasado del grupo (el capítulo desde el que arrancarían si lo vieran todos juntos).
 function commonLine(anime, seasonLabel, guildId, people) {
+	const title = getDisplayTitle(anime);
 	const lastNotified = getLastNotifiedAv1Episode({ seasonLabel, malId: anime.malId, guildId });
-	if (!lastNotified) return `• ${anime.title}`;
+	if (!lastNotified) return `• ${title}`;
 	const minWatched = Math.min(...people.map((p) => getEpisodesWatched({ seasonLabel, malId: anime.malId, discordId: p.id })));
-	return `• ${anime.title} — ${rangeText(lastNotified, minWatched)}`;
+	return `• ${title} — ${rangeText(lastNotified, minWatched)}`;
 }
 
 // Cruza a cada anime de la temporada contra quiénes de `people` lo ven. Si TODOS lo ven, va al
@@ -144,48 +148,6 @@ function buildSections(people, { individualByPerson, common }, seasonLabel, guil
 	return blocks;
 }
 
-// Agrupa los bloques en páginas de hasta MAX_CHARS_PER_PAGE caracteres, sin partir un bloque a la
-// mitad salvo que el bloque solo ya supere el límite (caso raro: alguien con decenas de animes).
-function paginate(blocks) {
-	const pages = [];
-	let current = [];
-	let currentLen = 0;
-
-	for (const block of blocks) {
-		if (block.length > MAX_CHARS_PER_PAGE) {
-			if (current.length > 0) {
-				pages.push(current.join('\n\n'));
-				current = [];
-				currentLen = 0;
-			}
-			for (const line of block.split('\n')) {
-				if (currentLen + line.length + 1 > MAX_CHARS_PER_PAGE && current.length > 0) {
-					pages.push(current.join('\n'));
-					current = [];
-					currentLen = 0;
-				}
-				current.push(line);
-				currentLen += line.length + 1;
-			}
-			pages.push(current.join('\n'));
-			current = [];
-			currentLen = 0;
-			continue;
-		}
-
-		if (currentLen + block.length + 2 > MAX_CHARS_PER_PAGE && current.length > 0) {
-			pages.push(current.join('\n\n'));
-			current = [];
-			currentLen = 0;
-		}
-		current.push(block);
-		currentLen += block.length + 2;
-	}
-	if (current.length > 0) pages.push(current.join('\n\n'));
-
-	return pages.length > 0 ? pages : [''];
-}
-
 function buildPageContent(header, pages, pageIndex) {
 	const pageNote = pages.length > 1 ? ` (página ${pageIndex + 1}/${pages.length})` : '';
 	return `${header}${pageNote}\n\n${pages[pageIndex]}`;
@@ -225,7 +187,7 @@ async function handleSelect(interaction) {
 
 	const tracked = getAnimeForSeason(seasonLabel).filter((a) => a.guildId === interaction.guildId);
 	const comparison = compareAnime(tracked, seasonLabel, people);
-	const pages = paginate(buildSections(people, comparison, seasonLabel, interaction.guildId));
+	const pages = paginateBlocks(buildSections(people, comparison, seasonLabel, interaction.guildId), MAX_CHARS_PER_PAGE);
 
 	const names = people.map((p) => `**${p.displayName}**`).join(', ');
 	const header = `Animes de ${names} en **${seasonLabel}**:`;

@@ -1,5 +1,6 @@
 const { ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder } = require('discord.js');
 const { slugForCustomId } = require('./seasonLabel');
+const { getDisplayTitle } = require('./services/db');
 
 const VOTE_STATE_COLOR = { verde: 0x57f287, naranja: 0xe67e22 };
 
@@ -16,7 +17,7 @@ function formatProgressLines(progress) {
 
 function buildAnimeEmbed(anime, { voteState, progress } = {}) {
 	const embed = new EmbedBuilder()
-		.setTitle(anime.title)
+		.setTitle(getDisplayTitle(anime))
 		.setURL(anime.url)
 		.setColor(VOTE_STATE_COLOR[voteState] ?? 0x2f3136);
 

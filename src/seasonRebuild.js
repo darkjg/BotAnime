@@ -1,5 +1,6 @@
-const { deleteSeasonTab, ensureSeasonTab, ensureAnimeColumn, setVote } = require('./services/sheets');
-const { getAnimeForSeason, getVotesForSeason, getEpisodesWatched } = require('./services/db');
+const { deleteSeasonTab, ensureSeasonTab, ensureAnimeColumn, setVote, canonicalSeasonTabName } = require('./services/sheets');
+const { conReintentoDeCuota } = require('./services/reintento');
+const { getAnimeForSeason, getVotesForSeason, getEpisodesWatched, getDisplayTitle } = require('./services/db');
 
 // Cada ensureAnimeColumn/setVote dispara varias llamadas de lectura a la API de Sheets (buscar
 // columna, leer día de emisión, revisar huecos...). Reconstruir una temporada entera vota "de nuevo"
@@ -18,9 +19,23 @@ function sleep(ms) {
 // pestaña entera (sin restos de merges/bordes/huecos de inserciones o reparaciones anteriores) y la
 // vuelve a armar votando "de nuevo" cada voto guardado, en el mismo orden en que ensureAnimeColumn ya
 // sabe ordenar por día de emisión.
-async function rebuildSeasonTab(seasonLabel, guildId) {
-	await deleteSeasonTab(seasonLabel);
-	await ensureSeasonTab(seasonLabel);
+// onProgress({ hecho, total, fase, segundosPorPaso }) se llama al empezar y tras cada paso (columna o voto).
+// Esperas ante el límite de lecturas de Google (se renueva cada minuto). Reconstruir borra la pestaña antes de
+// rehacerla, así que si un paso falla por cuota a medias la hoja se queda vacía: cada paso reintenta bastante
+// antes de rendirse.
+const ESPERAS_CUOTA_RECONSTRUIR_MS = [20_000, 40_000, 60_000, 60_000, 60_000];
+
+async function rebuildSeasonTab(seasonLabel, guildId, { onProgress = null, throttleMs = THROTTLE_MS, esperasCuota = ESPERAS_CUOTA_RECONSTRUIR_MS, dormirCuota } = {}) {
+	const reintentar = (tarea) => conReintentoDeCuota(tarea, { esperas: esperasCuota, ...(dormirCuota ? { dormir: dormirCuota } : {}) });
+	const avisar = (datos) => { try { onProgress?.({ segundosPorPaso: throttleMs / 1000, ...datos }); } catch { /* el aviso de progreso nunca debe romper la reconstrucción */ } };
+
+	// Si la pestaña existe con otras mayúsculas hay que trabajar con SU nombre: borrarla y recrearla con
+	// otra variante dejaría la pestaña real borrada y la nueva vacía, porque los animes y votos de la base
+	// están indexados con la cadena original y no se encontrarían.
+	seasonLabel = await reintentar(() => canonicalSeasonTabName(seasonLabel));
+
+	await reintentar(() => deleteSeasonTab(seasonLabel));
+	await reintentar(() => ensureSeasonTab(seasonLabel));
 
 	// getAnimeForSeason no filtra por guild: dos guilds pueden compartir la misma etiqueta de
 	// temporada (hoy apuntan a la misma sheet, pero eso podría cambiar) y sin este filtro se
@@ -34,6 +49,11 @@ async function rebuildSeasonTab(seasonLabel, guildId) {
 			.map((a) => [a.malId, a]),
 	);
 	const votes = getVotesForSeason(seasonLabel);
+	const columnas = [...animeByMalId.values()].filter((a) => a.isCarryover || a.isAbandoned);
+	const votosAAplicar = votes.filter((v) => v.voteType !== 'rojo' && animeByMalId.has(v.malId));
+	const total = columnas.length + votosAAplicar.length;
+	let hecho = 0;
+	avisar({ hecho, total, fase: 'Pestaña recreada, colocando columnas...' });
 
 	// El carryover (CONTINUAN) crea su columna aunque nadie haya votado todavía; lo mismo un abandonado
 	// (por definición ya no tiene votos verde/naranja que lo recreen abajo, así que sin esto
@@ -42,21 +62,22 @@ async function rebuildSeasonTab(seasonLabel, guildId) {
 	// abandonado (quién iba por qué capítulo cuando lo dejó) no se puede recuperar acá: esa info solo
 	// vivía en la celda de la sheet, no en la base local (los votos se borran al abandonar), así que se
 	// pierde en una reconstrucción igual que ya pasaba con cualquier voto ya retirado.
-	for (const anime of animeByMalId.values()) {
-		if (!anime.isCarryover && !anime.isAbandoned) continue;
-		await ensureAnimeColumn(seasonLabel, anime);
-		await sleep(THROTTLE_MS);
+	for (const anime of columnas) {
+		await reintentar(() => ensureAnimeColumn(seasonLabel, { ...anime, title: getDisplayTitle(anime) }));
+		hecho += 1;
+		avisar({ hecho, total, fase: `Columna: ${getDisplayTitle(anime)}` });
+		await sleep(throttleMs);
 	}
 
 	let votesApplied = 0;
-	for (const vote of votes) {
-		if (vote.voteType === 'rojo') continue;
+	for (const vote of votosAAplicar) {
 		const anime = animeByMalId.get(vote.malId);
-		if (!anime) continue;
 		const episodesWatched = getEpisodesWatched({ seasonLabel, malId: vote.malId, discordId: vote.discordId });
-		await setVote(seasonLabel, vote.displayName, anime, vote.voteType, episodesWatched);
+		await setVote(seasonLabel, vote.displayName, { ...anime, title: getDisplayTitle(anime) }, vote.voteType, episodesWatched);
 		votesApplied += 1;
-		await sleep(THROTTLE_MS);
+		hecho += 1;
+		avisar({ hecho, total, fase: `Voto de ${vote.displayName}: ${getDisplayTitle(anime)}` });
+		await sleep(throttleMs);
 	}
 
 	return { animeCount: animeByMalId.size, votesApplied };

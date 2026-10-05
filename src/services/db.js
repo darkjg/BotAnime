@@ -180,6 +180,24 @@ function setLinkFixEnabled(guildId, enabled) {
 	upsertGuildSetting(guildId, 'linkFixEnabled', toBit(enabled));
 }
 
+const upsertLinkFixSiteStmt = db.prepare(`
+	INSERT INTO link_fix_sites (guildId, site, enabled) VALUES (?, ?, ?)
+	ON CONFLICT (guildId, site) DO UPDATE SET enabled = excluded.enabled
+`);
+function setLinkFixSiteEnabled(guildId, site, enabled) {
+	if (site === 'x') return setLinkFixEnabled(guildId, enabled);
+	upsertLinkFixSiteStmt.run(guildId, site, toBit(enabled));
+}
+
+const selectLinkFixSitesStmt = db.prepare(`SELECT site FROM link_fix_sites WHERE guildId = ? AND enabled = 1`);
+// Set con las claves de los sitios de /link-fix activos en el servidor (incluye 'x' si el
+// interruptor histórico está activo).
+function getLinkFixSitesEnabled(guildId) {
+	const activos = new Set(selectLinkFixSitesStmt.all(guildId).map((row) => row.site));
+	if (getLinkFixEnabled(guildId)) activos.add('x');
+	return activos;
+}
+
 function getForumChannel(guildId) {
 	const row = getGuildSettingsRow(guildId);
 	if (!row || row.forumChannelId == null) return null;
@@ -192,6 +210,21 @@ const upsertForumChannelStmt = db.prepare(`
 `);
 function setForumChannel({ guildId, channelId, seasonLabel }) {
 	upsertForumChannelStmt.run(guildId, channelId, seasonLabel);
+}
+
+const selectSeasonForumStmt = db.prepare(`SELECT channelId FROM season_forums WHERE guildId = ? AND seasonLabel = ?`);
+const upsertSeasonForumStmt = db.prepare(`
+	INSERT INTO season_forums (guildId, seasonLabel, channelId) VALUES (?, ?, ?)
+	ON CONFLICT (guildId, seasonLabel) DO UPDATE SET channelId = excluded.channelId
+`);
+
+// Id del canal de foro de esa temporada en ese servidor, o null si todavía no tiene uno.
+function getSeasonForum({ guildId, seasonLabel }) {
+	return selectSeasonForumStmt.get(guildId, seasonLabel)?.channelId ?? null;
+}
+
+function setSeasonForum({ guildId, seasonLabel, channelId }) {
+	upsertSeasonForumStmt.run(guildId, seasonLabel, channelId);
 }
 
 // --- votes -----------------------------------------------------------------------------------------
@@ -209,6 +242,23 @@ function recordVote({ seasonLabel, malId, discordId, displayName, voteType }) {
 const deleteVoteStmt = db.prepare(`DELETE FROM votes WHERE seasonLabel = ? AND malId = ? AND discordId = ?`);
 function removeVote({ seasonLabel, malId, discordId }) {
 	deleteVoteStmt.run(seasonLabel, malId, discordId);
+}
+
+// Para cuando alguien se fue del server y los avisos automáticos de nuevo capítulo le seguirían
+// llegando para siempre (getWatchers sigue viendo sus votos "verde"/"naranja" en cada anime que
+// seguía): borra TODOS sus votos de una, en cualquier temporada. Devuelve cuántos borró.
+const deleteAllVotesForUserStmt = db.prepare(`DELETE FROM votes WHERE discordId = ?`);
+function deleteAllVotesForUser({ discordId }) {
+	return Number(deleteAllVotesForUserStmt.run(discordId).changes);
+}
+
+// Para /quitar-usuario: qué había que borrar, ANTES de borrarlo — así se sabe en qué temporadas
+// tenía fila en la sheet (displayName) y qué animes hay que revisar por si se quedaron sin nadie
+// viéndolos (ver syncAbandonedState en interactions.js, que hace exactamente eso tras un
+// voto/desvoto normal pero no se dispara desde este borrado directo en BD).
+const selectVotesForUserStmt = db.prepare(`SELECT seasonLabel, malId, displayName FROM votes WHERE discordId = ?`);
+function getVotesForUser({ discordId }) {
+	return selectVotesForUserStmt.all(discordId);
 }
 
 const selectWatchersStmt = db.prepare(`SELECT discordId FROM votes WHERE seasonLabel = ? AND malId = ? AND voteType IN ('verde', 'naranja')`);
@@ -261,7 +311,25 @@ const addEpisodesWatchedStmt = db.prepare(`
 // que poder marcarse aunque el voto sea rojo o todavía no exista, y los botones +/- de capítulo no
 // dependen de haber votado.
 function addEpisodesWatched({ seasonLabel, malId, discordId, displayName, delta }) {
-	return addEpisodesWatchedStmt.get({ seasonLabel, malId, discordId, displayName, delta }).episodesWatched;
+	const episodesWatched = addEpisodesWatchedStmt.get({ seasonLabel, malId, discordId, displayName, delta }).episodesWatched;
+	syncEpisodesWatchedAcrossSeasons({ seasonLabel, malId, discordId, displayName, episodesWatched });
+	return episodesWatched;
+}
+
+// Un anime que continúa de una temporada a otra (carryover, ej. One Piece) tiene una fila de progreso
+// por cada temporada donde apareció, pero es la MISMA persona viendo el MISMO anime: el capítulo real no
+// depende de en qué hilo (temporada) se haya pulsado "Actualizar capítulo". Sin esto, actualizar en el
+// hilo de la temporada vieja (que sigue existiendo y la gente sigue usando por costumbre) dejaba la
+// temporada nueva con un número desactualizado, y /pendientes avisaba de capítulos que ya se habían visto
+// (caso real: One Piece, 2026-09-23). Se propaga como máximo (nunca hace retroceder un progreso mayor
+// que ya estuviera en otra temporada) a todas las filas existentes de ese malId+persona, sin crear filas
+// nuevas en temporadas donde ese anime no se llegó a trackear.
+const syncEpisodesWatchedStmt = db.prepare(`
+	UPDATE progress SET episodesWatched = MAX(episodesWatched, @episodesWatched), displayName = @displayName
+	WHERE malId = @malId AND discordId = @discordId AND seasonLabel <> @seasonLabel
+`);
+function syncEpisodesWatchedAcrossSeasons({ seasonLabel, malId, discordId, displayName, episodesWatched }) {
+	syncEpisodesWatchedStmt.run({ seasonLabel, malId, discordId, displayName, episodesWatched });
 }
 
 const setEpisodesWatchedStmt = db.prepare(`
@@ -276,7 +344,9 @@ const setEpisodesWatchedStmt = db.prepare(`
 // absoluto: lo usa /capitulo, donde el autocompletado ya sugiere el capítulo actual y la persona escribe
 // directamente "por cuál va", no cuánto sumar.
 function setEpisodesWatched({ seasonLabel, malId, discordId, displayName, episodesWatched }) {
-	return setEpisodesWatchedStmt.get({ seasonLabel, malId, discordId, displayName, episodesWatched }).episodesWatched;
+	const result = setEpisodesWatchedStmt.get({ seasonLabel, malId, discordId, displayName, episodesWatched }).episodesWatched;
+	syncEpisodesWatchedAcrossSeasons({ seasonLabel, malId, discordId, displayName, episodesWatched: result });
+	return result;
 }
 
 const selectVotesForSeasonStmt = db.prepare(`SELECT * FROM votes WHERE seasonLabel = ?`);
@@ -315,6 +385,137 @@ function setLastNotifiedAv1Episode({ seasonLabel, malId, guildId, episode }) {
 	upsertAv1EntryStmt.run(guildId, seasonLabel, malId, episode, Date.now());
 }
 
+// --- botState ----------------------------------------------------------------------------------------
+
+const selectBotStateStmt = db.prepare(`SELECT value FROM bot_state WHERE key = ?`);
+const upsertBotStateStmt = db.prepare(`
+	INSERT INTO bot_state (key, value) VALUES (?, ?)
+	ON CONFLICT (key) DO UPDATE SET value = excluded.value
+`);
+
+function getBotState(key) {
+	return selectBotStateStmt.get(key)?.value ?? null;
+}
+
+function setBotState(key, value) {
+	upsertBotStateStmt.run(key, String(value));
+}
+
+// --- av1PendingNotices -------------------------------------------------------------------------------
+
+const upsertPendingNoticeStmt = db.prepare(`
+	INSERT INTO av1_pending_notices (guildId, seasonLabel, malId, episode, payload, createdAt) VALUES (?, ?, ?, ?, ?, ?)
+	ON CONFLICT (guildId, seasonLabel, malId, episode) DO UPDATE SET payload = excluded.payload
+`);
+const hasPendingNoticeStmt = db.prepare(`SELECT 1 AS found FROM av1_pending_notices WHERE guildId = ? AND seasonLabel = ? AND malId = ? AND episode = ?`);
+const listPendingNoticesStmt = db.prepare(`SELECT guildId, seasonLabel, malId, episode, payload, createdAt FROM av1_pending_notices ORDER BY createdAt`);
+const deletePendingNoticeStmt = db.prepare(`DELETE FROM av1_pending_notices WHERE guildId = ? AND seasonLabel = ? AND malId = ? AND episode = ?`);
+
+function savePendingNotice({ guildId, seasonLabel, malId, episode, payload }) {
+	upsertPendingNoticeStmt.run(guildId, seasonLabel, malId, episode, JSON.stringify(payload), Date.now());
+}
+
+function hasPendingNotice({ guildId, seasonLabel, malId, episode }) {
+	return Boolean(hasPendingNoticeStmt.get(guildId, seasonLabel, malId, episode));
+}
+
+function listPendingNotices() {
+	return listPendingNoticesStmt.all().map((row) => ({ ...row, payload: JSON.parse(row.payload) }));
+}
+
+function deletePendingNotice({ guildId, seasonLabel, malId, episode }) {
+	deletePendingNoticeStmt.run(guildId, seasonLabel, malId, episode);
+}
+
+// --- vacacionesGrebe ---------------------------------------------------------------------------------
+
+const selectVacacionesStmt = db.prepare(`SELECT id, desde, hasta FROM vacaciones_grebe ORDER BY desde`);
+const insertVacacionStmt = db.prepare(`INSERT INTO vacaciones_grebe (desde, hasta, creadoPor, creadoEn) VALUES (?, ?, ?, ?)`);
+const deleteVacacionStmt = db.prepare(`DELETE FROM vacaciones_grebe WHERE id = ?`);
+
+const MS_POR_DIA = 86_400_000;
+const isoADia = (iso) => Math.floor(Date.parse(`${iso}T00:00:00Z`) / MS_POR_DIA);
+const diaAIso = (dia) => new Date(dia * MS_POR_DIA).toISOString().slice(0, 10);
+
+function listVacacionesGrebe() {
+	return selectVacacionesStmt.all().map((row) => ({ ...row }));
+}
+
+// Guarda un periodo (fechas 'YYYY-MM-DD', ambas incluidas) y lo une con los que se solapen o queden
+// pegados, para que la lista nunca tenga periodos partidos. Devuelve el periodo resultante y cuántos
+// existentes se unieron.
+function saveVacacionGrebe({ desde, hasta, creadoPor }) {
+	let inicio = isoADia(desde);
+	let fin = isoADia(hasta);
+	const nuevoInicio = inicio;
+	const nuevoFin = fin;
+
+	db.exec('BEGIN');
+	try {
+		const unidas = selectVacacionesStmt
+			.all()
+			.filter((row) => isoADia(row.desde) <= nuevoFin + 1 && isoADia(row.hasta) >= nuevoInicio - 1);
+		for (const row of unidas) {
+			inicio = Math.min(inicio, isoADia(row.desde));
+			fin = Math.max(fin, isoADia(row.hasta));
+			deleteVacacionStmt.run(row.id);
+		}
+		const res = insertVacacionStmt.run(diaAIso(inicio), diaAIso(fin), creadoPor, Date.now());
+		db.exec('COMMIT');
+		return { id: Number(res.lastInsertRowid), desde: diaAIso(inicio), hasta: diaAIso(fin), unidas: unidas.length };
+	} catch (err) {
+		db.exec('ROLLBACK');
+		throw err;
+	}
+}
+
+function deleteVacacionGrebe(id) {
+	return Number(deleteVacacionStmt.run(id).changes) > 0;
+}
+
+// --- quedadas ----------------------------------------------------------------------------------------
+
+const insertQuedadaStmt = db.prepare(`
+	INSERT INTO quedadas (guildId, seasonLabel, malId, title, fecha, hora, startsAt, weekly, note, createdBy, createdAt, hourSent, startSent)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+`);
+const selectQuedadaStmt = db.prepare(`SELECT * FROM quedadas WHERE id = ?`);
+const selectQuedadasGuildStmt = db.prepare(`SELECT * FROM quedadas WHERE guildId = ? ORDER BY startsAt`);
+const selectQuedadasAllStmt = db.prepare(`SELECT * FROM quedadas ORDER BY startsAt`);
+const deleteQuedadaStmt = db.prepare(`DELETE FROM quedadas WHERE id = ?`);
+
+const quedadaFromRow = (row) => (row ? { ...row, weekly: Boolean(row.weekly), hourSent: Boolean(row.hourSent), startSent: Boolean(row.startSent) } : null);
+
+function createQuedada({ guildId, seasonLabel, malId, title, fecha, hora, startsAt, weekly, note, createdBy, hourSent }) {
+	const res = insertQuedadaStmt.run(guildId, seasonLabel, malId, title, fecha, hora, startsAt, toBit(weekly), note ?? null, createdBy, Date.now(), toBit(hourSent));
+	return Number(res.lastInsertRowid);
+}
+
+function getQuedada(id) {
+	return quedadaFromRow(selectQuedadaStmt.get(id));
+}
+
+function listQuedadasGuild(guildId) {
+	return selectQuedadasGuildStmt.all(guildId).map(quedadaFromRow);
+}
+
+function listQuedadas() {
+	return selectQuedadasAllStmt.all().map(quedadaFromRow);
+}
+
+function deleteQuedada(id) {
+	return Number(deleteQuedadaStmt.run(id).changes) > 0;
+}
+
+// Solo lo que cambia al avanzar una quedada: los nombres de columna salen de esta lista, no de quien llama.
+const CAMPOS_QUEDADA = new Set(['fecha', 'hora', 'startsAt', 'hourSent', 'startSent']);
+function updateQuedada(id, campos) {
+	const claves = Object.keys(campos);
+	for (const clave of claves) if (!CAMPOS_QUEDADA.has(clave)) throw new Error(`campo de quedada no permitido: ${clave}`);
+	const valores = claves.map((clave) => (typeof campos[clave] === 'boolean' ? toBit(campos[clave]) : campos[clave]));
+	db.prepare(`UPDATE quedadas SET ${claves.map((clave) => `${clave} = ?`).join(', ')} WHERE id = ?`).run(...valores, id);
+}
+
 // Antes comparaba semana calendario (lunes a domingo): un episodio detectado el sábado dejaba de contar
 // el martes siguiente aunque solo hubieran pasado 3 días, porque ya se había cruzado a la semana
 // calendario nueva. Cambiado a una ventana corrediza de 7 días desde la detección (pedido del usuario
@@ -346,6 +547,15 @@ function setAv1ForumThread({ guildId, seasonLabel, malId, threadId }) {
 const selectAv1ForumThreadStmt = db.prepare(`SELECT threadId FROM av1_forum_threads WHERE guildId = ? AND seasonLabel = ? AND malId = ?`);
 function getAv1ForumThread({ guildId, seasonLabel, malId }) {
 	return selectAv1ForumThreadStmt.get(guildId, seasonLabel, malId)?.threadId ?? null;
+}
+
+// Fallback de getAv1ForumThread para cuando el carryover a la temporada nueva no llegó a crear un hilo
+// ahí (p.ej. falló esa creación puntual en publishSeasonForum y quedó sin loguear el detalle) — en vez
+// de dejar el aviso/link sin ningún hilo, busca el hilo real que sí existe de otra temporada para el
+// mismo anime (el hilo de Discord sigue existiendo y siendo válido aunque ya no sea el de la temporada activa).
+const selectAv1ForumThreadAnySeasonStmt = db.prepare(`SELECT threadId FROM av1_forum_threads WHERE guildId = ? AND malId = ? LIMIT 1`);
+function getAv1ForumThreadAnySeason({ guildId, malId }) {
+	return selectAv1ForumThreadAnySeasonStmt.get(guildId, malId)?.threadId ?? null;
 }
 
 // --- episodeLinkMessages -----------------------------------------------------------------------------
@@ -395,6 +605,18 @@ function deleteEpisodeLinkMessage({ guildId, seasonLabel, malId, episode }) {
 const deleteExpiredEpisodeLinkMessagesStmt = db.prepare(`DELETE FROM episode_link_messages WHERE postedAt < ?`);
 const selectDueEpisodeLinkMessagesStmt = db.prepare(`SELECT * FROM episode_link_messages WHERE postedAt >= ?`);
 
+const selectEpisodeLinkMessageStmt = db.prepare(
+	`SELECT threadId, messageId FROM episode_link_messages WHERE guildId = ? AND seasonLabel = ? AND malId = ? AND episode = ?`,
+);
+// A diferencia de collectDueEpisodeLinkChecks, esto NO poda nada (es de solo lectura) — lo usa
+// /pendientes para linkear directo al mensaje de descargas del último capítulo detectado. Puede
+// devolver null si ya se podó por vencer PROVIDER_RECHECK_MAX_AGE_MS (4 días) o si nunca se llegó a
+// publicar (ver el bug real de getDownloadLinks en animeav1.js, corregido 2026-09-11): en ese caso
+// quien llama debería caer a linkear el hilo del foro en general (getAv1ForumThread) en vez del capítulo puntual.
+function getEpisodeLinkMessage({ guildId, seasonLabel, malId, episode }) {
+	return selectEpisodeLinkMessageStmt.get(guildId, seasonLabel, malId, episode) ?? null;
+}
+
 // Devuelve las entradas todavía dentro de la ventana de rechequeo (no más viejas que maxAgeMs), podando
 // de paso las que ya se pasaron: no tiene sentido seguir revisando capítulos de hace semanas para
 // siempre.
@@ -404,11 +626,133 @@ function collectDueEpisodeLinkChecks(maxAgeMs) {
 	return selectDueEpisodeLinkMessagesStmt.all(cutoff).map((row) => ({ ...row, providers: JSON.parse(row.providers), hasErai: Boolean(row.hasErai) }));
 }
 
+// --- anime_nicknames (/apodo) --------------------------------------------------------------------
+
+const upsertAnimeNicknameStmt = db.prepare(`
+	INSERT INTO anime_nicknames (malId, nickname, setBy, setAt) VALUES (?, ?, ?, ?)
+	ON CONFLICT (malId) DO UPDATE SET nickname = excluded.nickname, setBy = excluded.setBy, setAt = excluded.setAt
+`);
+const deleteAnimeNicknameStmt = db.prepare(`DELETE FROM anime_nicknames WHERE malId = ?`);
+// nickname vacío/null borra el apodo en vez de guardar un apodo vacío.
+function setAnimeNickname({ malId, nickname, setBy }) {
+	const trimmed = (nickname ?? '').trim();
+	if (!trimmed) {
+		deleteAnimeNicknameStmt.run(malId);
+		return null;
+	}
+	upsertAnimeNicknameStmt.run(malId, trimmed, setBy ?? null, Date.now());
+	return trimmed;
+}
+
+const selectAnimeNicknameStmt = db.prepare(`SELECT nickname FROM anime_nicknames WHERE malId = ?`);
+function getAnimeNickname(malId) {
+	return selectAnimeNicknameStmt.get(malId)?.nickname ?? null;
+}
+
+// Título a MOSTRAR (apodo si tiene, si no el título real de MAL) — usar en hilos/embeds/comandos/sheet.
+// anime.title en sí (la tabla `anime`) nunca se toca: el cruce contra animeav1.com (checkAndNotifyAv1
+// en scheduler.js) necesita el título real para emparejar, no el apodo.
+function getDisplayTitle(anime) {
+	return getAnimeNickname(anime.malId) ?? anime.title;
+}
+
+// --- yumi_games (/yumi) --------------------------------------------------------------------------
+
+const insertYumiGameStmt = db.prepare(`INSERT INTO yumi_games (won, at) VALUES (?, ?)`);
+function addYumiGame({ won }) {
+	insertYumiGameStmt.run(won ? 1 : 0, Date.now());
+}
+
+const deleteLastYumiGameStmt = db.prepare(`DELETE FROM yumi_games WHERE id = (SELECT MAX(id) FROM yumi_games) RETURNING won`);
+// Devuelve { won } de la partida borrada, o null si no había ninguna.
+function undoLastYumiGame() {
+	const row = deleteLastYumiGameStmt.get();
+	return row ? { won: Boolean(row.won) } : null;
+}
+
+const selectYumiStatsStmt = db.prepare(`SELECT COUNT(*) AS games, COALESCE(SUM(1 - won), 0) AS losses FROM yumi_games`);
+function getYumiStats() {
+	const { games, losses } = selectYumiStatsStmt.get();
+	return { games, losses, wins: games - losses };
+}
+
+// --- reminders (/recordatorio) -----------------------------------------------------------------------
+
+const insertReminderStmt = db.prepare(`
+	INSERT INTO reminders (guildId, channelId, discordId, displayName, message, dueAt, createdAt, notified, repeatEveryMs)
+	VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
+`);
+// repeatEveryMs: null/omitido = aviso único; un número (ms) = se repite cada tanto hasta que se cancele.
+function createReminder({ guildId, channelId, discordId, displayName, message, dueAt, repeatEveryMs = null }) {
+	const res = insertReminderStmt.run(guildId, channelId, discordId, displayName, message, dueAt, Date.now(), repeatEveryMs);
+	return Number(res.lastInsertRowid);
+}
+
+const reminderFromRow = (row) => (row ? { ...row, notified: Boolean(row.notified) } : null);
+
+const selectReminderStmt = db.prepare(`SELECT * FROM reminders WHERE id = ?`);
+function getReminder(id) {
+	return reminderFromRow(selectReminderStmt.get(id));
+}
+
+// Ordenados por fecha, más próximo primero: es como tiene sentido mostrarlos en /recordatorios.
+const selectPendingRemindersForUserStmt = db.prepare(
+	`SELECT * FROM reminders WHERE guildId = ? AND discordId = ? AND notified = 0 ORDER BY dueAt`,
+);
+function listPendingRemindersForUser({ guildId, discordId }) {
+	return selectPendingRemindersForUserStmt.all(guildId, discordId).map(reminderFromRow);
+}
+
+// Todos los pendientes de todos los servidores, para el chequeo periódico; el filtro por dueAt se hace
+// en JS (pasar `ahora` acá obligaría a re-preparar el statement por cada chequeo).
+const selectAllPendingRemindersStmt = db.prepare(`SELECT * FROM reminders WHERE notified = 0 ORDER BY dueAt`);
+function listPendingReminders() {
+	return selectAllPendingRemindersStmt.all().map(reminderFromRow);
+}
+
+const markReminderNotifiedStmt = db.prepare(`UPDATE reminders SET notified = 1 WHERE id = ?`);
+function markReminderNotified(id) {
+	markReminderNotifiedStmt.run(id);
+}
+
+// Para los recordatorios repetidos: en vez de darlos por avisados, se mueven a su siguiente ocurrencia.
+const rescheduleReminderStmt = db.prepare(`UPDATE reminders SET dueAt = ? WHERE id = ?`);
+function rescheduleReminder(id, dueAt) {
+	rescheduleReminderStmt.run(dueAt, id);
+}
+
+const deleteReminderStmt = db.prepare(`DELETE FROM reminders WHERE id = ? AND discordId = ?`);
+// Solo lo puede cancelar quien lo creó (discordId en el WHERE, no solo el id) — devuelve false si no
+// era suyo o ya no existía, para poder avisar distinto en cada caso.
+function deleteReminder({ id, discordId }) {
+	return Number(deleteReminderStmt.run(id, discordId).changes) > 0;
+}
+
+// Para cuando alguien se fue del server y sus recordatorios pendientes se quedarían disparando para
+// siempre: borra TODOS los suyos en este server de una, en vez de uno por uno. Devuelve cuántos borró.
+const deleteAllRemindersForUserStmt = db.prepare(`DELETE FROM reminders WHERE guildId = ? AND discordId = ?`);
+function deleteAllRemindersForUser({ guildId, discordId }) {
+	return Number(deleteAllRemindersForUserStmt.run(guildId, discordId).changes);
+}
+
 module.exports = {
+	addYumiGame,
+	undoLastYumiGame,
+	getYumiStats,
+	createReminder,
+	getReminder,
+	listPendingRemindersForUser,
+	listPendingReminders,
+	markReminderNotified,
+	rescheduleReminder,
+	deleteReminder,
+	deleteAllRemindersForUser,
 	upsertAnime,
 	setAnimeAbandoned,
 	recordVote,
 	removeVote,
+	deleteAllVotesForUser,
+	getVotesForUser,
 	getWatchers,
 	getUserVote,
 	getVoteState,
@@ -428,14 +772,35 @@ module.exports = {
 	setVoteRole,
 	getLinkFixEnabled,
 	setLinkFixEnabled,
+	setLinkFixSiteEnabled,
+	getLinkFixSitesEnabled,
+	getBotState,
+	setBotState,
+	savePendingNotice,
+	hasPendingNotice,
+	listPendingNotices,
+	deletePendingNotice,
+	listVacacionesGrebe,
+	saveVacacionGrebe,
+	deleteVacacionGrebe,
+	createQuedada,
+	getQuedada,
+	listQuedadasGuild,
+	listQuedadas,
+	deleteQuedada,
+	updateQuedada,
 	getForumChannel,
 	setForumChannel,
+	getSeasonForum,
+	setSeasonForum,
 	getAv1ForumThread,
+	getAv1ForumThreadAnySeason,
 	setAv1ForumThread,
 	recordEpisodeLinkMessage,
 	updateEpisodeLinkMessageProviders,
 	deleteEpisodeLinkMessage,
 	collectDueEpisodeLinkChecks,
+	getEpisodeLinkMessage,
 	getAnimeForSeason,
 
 	getAllAnime,
@@ -447,4 +812,9 @@ module.exports = {
 
 	recordSeasonHistory,
 	getPreviousSeasonLabel,
+
+
+	setAnimeNickname,
+	getAnimeNickname,
+	getDisplayTitle,
 };

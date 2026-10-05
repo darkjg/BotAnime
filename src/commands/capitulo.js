@@ -7,16 +7,16 @@ const {
 	getEpisodesWatched,
 	getUserVotedAnime,
 	getUserVote,
-	isCaughtUpThisWeek,
 	getVoteState,
 	getWatchersWithProgress,
 	getAv1ForumThread,
-	getAnimeAcrossGuilds,
+	getDisplayTitle,
 } = require('../services/db');
-const { setVote } = require('../services/sheets');
+const { refrescarCeldaDeProgreso, textoFallosSheet } = require('../sheetProgress');
 const { getAnime } = require('../seasonCache');
 const { buildAnimeEmbed, buildVoteRow } = require('../components');
 const { autoCleanupReply } = require('../ephemeral');
+const { reabrirSiArchivado } = require('../threadUtil');
 
 const data = new SlashCommandBuilder()
 	.setName('capitulo')
@@ -42,10 +42,11 @@ async function autocompleteAnime(interaction, seasonLabel) {
 	const choices = getAnimeForSeason(seasonLabel)
 		.filter((anime) => anime.guildId === interaction.guildId)
 		.filter((anime) => votedMalIds.has(anime.malId))
-		.filter((anime) => anime.title.toLowerCase().includes(focused))
+		// Busca por título real O por apodo, para que se pueda encontrar tipeando cualquiera de los dos.
+		.filter((anime) => anime.title.toLowerCase().includes(focused) || getDisplayTitle(anime).toLowerCase().includes(focused))
 		.filter((anime) => (vistos.has(anime.malId) ? false : (vistos.add(anime.malId), true)))
 		.slice(0, 25)
-		.map((anime) => ({ name: anime.title.slice(0, 100), value: String(anime.malId) }));
+		.map((anime) => ({ name: getDisplayTitle(anime).slice(0, 100), value: String(anime.malId) }));
 
 	await interaction.respond(choices);
 }
@@ -124,19 +125,16 @@ async function execute(interaction) {
 	const episodesWatched = setEpisodesWatched({ seasonLabel, malId, discordId: targetUser.id, displayName, episodesWatched: newCount });
 
 	// Si ya tiene un voto puesto, la celda de la sheet queda vieja hasta que se refresque con el
-	// capítulo nuevo; si no votó (o votó rojo), no hay celda que actualizar. El voto/progreso es un solo
-	// hecho real (no depende del guild desde el que se corrió /capitulo), así que se escribe en la
-	// sheet de CADA guild que tenga este anime registrado, no solo la de este guild.
+	// capítulo nuevo; si no votó (o votó rojo), no hay celda que actualizar. La sheet es una sola: se escribe
+	// una vez (ver sheetProgress.js). Si Google sigue limitando las consultas tras los reintentos, el capítulo
+	// queda guardado en la base y se le avisa a quien lo pidió en vez de decirle solo "Listo".
+	let avisoSheet = '';
 	const vote = getUserVote({ seasonLabel, malId, discordId: targetUser.id });
 	if (vote && vote.voteType !== 'rojo') {
-		const registros = getAnimeAcrossGuilds({ seasonLabel, malId });
-		for (const registro of registros) {
-			const caughtUpThisWeek = isCaughtUpThisWeek({ seasonLabel, malId, guildId: registro.guildId, episodesWatched });
-			try {
-				await setVote(seasonLabel, displayName, registro, vote.voteType, episodesWatched, caughtUpThisWeek);
-			} catch (err) {
-				console.error(`[capitulo] no pude refrescar la celda de "${displayName}" en la sheet (guild ${registro.guildId}):`, err.message);
-			}
+		const resultado = await refrescarCeldaDeProgreso({ seasonLabel, malId, displayName, voteType: vote.voteType, episodesWatched });
+		if (!resultado.ok) {
+			console.error(`[capitulo] no pude refrescar la celda de "${displayName}" en la sheet:`, resultado.error.message);
+			avisoSheet = textoFallosSheet([{ displayName, error: resultado.error }]);
 		}
 	}
 
@@ -147,6 +145,7 @@ async function execute(interaction) {
 	if (threadId) {
 		try {
 			const thread = await interaction.client.channels.fetch(threadId);
+			await reabrirSiArchivado(thread);
 			const message = await thread.messages.fetch(threadId); // el post inicial comparte id con el hilo
 			const voteState = getVoteState({ seasonLabel, malId });
 			const progress = getWatchersWithProgress({ seasonLabel, malId });
@@ -161,7 +160,7 @@ async function execute(interaction) {
 
 	console.log(`[capitulo] ${interaction.user.tag} puso a ${displayName} en el capítulo ${episodesWatched} de "${anime.title}" (${seasonLabel})`);
 
-	await interaction.editReply(`Listo: **${displayName}** ahora va por el capítulo **${episodesWatched}** de **${anime.title}**.`);
+	await interaction.editReply(`Listo: **${displayName}** ahora va por el capítulo **${episodesWatched}** de **${getDisplayTitle(anime)}**.${avisoSheet}`);
 	autoCleanupReply(interaction);
 }
 

@@ -25,6 +25,7 @@ async function execute(interaction) {
 	const tracked = getAnimeForSeason(seasonLabel).filter((a) => a.guildId === interaction.guildId);
 	let updated = 0;
 	let skipped = 0;
+	let hidden = 0;
 
 	for (const anime of tracked) {
 		const threadId = getAv1ForumThread({ guildId: interaction.guildId, seasonLabel, malId: anime.malId });
@@ -35,6 +36,12 @@ async function execute(interaction) {
 
 		try {
 			const thread = await interaction.client.channels.fetch(threadId);
+			// Los hilos ocultos por inactividad no se tocan: reabrirlos todos de golpe anularía el ocultado. Se
+			// refrescan solos cuando alguien vota, actualiza el capítulo o cambia el apodo (ahí sí se reabren).
+			if (thread.archived) {
+				hidden += 1;
+				continue;
+			}
 			const message = await thread.messages.fetch(threadId); // el post inicial comparte id con el hilo
 			const voteState = getVoteState({ seasonLabel, malId: anime.malId });
 			const progress = getWatchersWithProgress({ seasonLabel, malId: anime.malId });
@@ -49,8 +56,8 @@ async function execute(interaction) {
 		}
 	}
 
-	console.log(`[refrescar-hilos] "${seasonLabel}": ${updated} hilo(s) actualizado(s), ${skipped} salteado(s)`);
-	await interaction.editReply(`Listo. Actualicé ${updated} hilo(s) de **${seasonLabel}**.${skipped > 0 ? ` Salteados: ${skipped}.` : ''}`);
+	console.log(`[refrescar-hilos] "${seasonLabel}": ${updated} hilo(s) actualizado(s), ${skipped} salteado(s), ${hidden} oculto(s)`);
+	await interaction.editReply(`Listo. Actualicé ${updated} hilo(s) de **${seasonLabel}**.${skipped > 0 ? ` Salteados: ${skipped}.` : ''}${hidden > 0 ? ` ${hidden} hilo(s) están ocultos por inactividad y no se tocaron (se actualizan solos cuando alguien los usa).` : ''}`);
 	autoCleanupReply(interaction);
 }
 
