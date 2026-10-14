@@ -10,7 +10,7 @@ const {
 	getWatchers,
 	getDisplayTitle,
 } = require('../services/db');
-const { getDownloadLinks, findSlugByTitle } = require('../services/animeav1');
+const { getDownloadLinks, findSlugByTitle, findSlugByMalId } = require('../services/animeav1');
 const { findEraiMagnet } = require('../services/nyaa');
 const { autoCleanupReply } = require('../ephemeral');
 const { reabrirSiArchivado } = require('../threadUtil');
@@ -154,6 +154,8 @@ async function execute(interaction) {
 			let slug = anime.slug;
 			if (!slug) {
 				slug = await withTimeout(12_000, findSlugByTitle(anime.title), `timeout buscando slug de "${anime.title}"`).catch(() => null);
+					// Animes que animeav1 lista con otro nombre que MAL: se cruzan por malId desde "Recientemente Actualizado".
+					slug ??= await withTimeout(30_000, findSlugByMalId(anime.malId), `timeout buscando slug por malId de "${anime.title}"`).catch(() => null);
 				if (slug) {
 					upsertAnime({ malId: anime.malId, seasonLabel: anime.seasonLabel, guildId: anime.guildId, slug });
 				}

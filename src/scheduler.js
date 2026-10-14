@@ -21,17 +21,20 @@ const {
 	hasPendingNotice,
 	listPendingNotices,
 	deletePendingNotice,
+	getAv1MediaId,
+	setAv1MediaId,
 } = require('./services/db');
 
 const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const { updateAnimeDay, repairSeasonTab } = require('./services/sheets');
 const { conServidor } = require('./services/sheetTarget');
-const { getRecentlyUpdatedEpisodes, normalizeTitle, getCoverImage, getDownloadLinks } = require('./services/animeav1');
+const { getRecentlyUpdatedEpisodes, normalizeTitle, getCoverImage, getDownloadLinks, findSlugByTitle, getMediaId, getMalIdBySlug } = require('./services/animeav1');
 const { findEraiMagnet } = require('./services/nyaa');
 
 const { buildEpisodeButtonRow, formatProgressLines } = require('./components');
 const { rememberAnime } = require('./seasonCache');
 const { reabrirSiArchivado } = require('./threadUtil');
+const { syncReactionGifs } = require('./services/auroraSync');
 const { isBackupMode, ensureWarpOnStartup } = require('./services/av1Net');
 const { onAv1FetchSuccess, onAv1FetchFailure } = require('./av1Backup');
 
@@ -47,6 +50,7 @@ const AV1_CHECK_INTERVAL_MS = 30 * 60 * 1000;
 // Un capítulo recién publicado suele tener solo 1Fichier/MP4Upload; Mega y el torrent (Erai-raws)
 // suelen tardar hasta unos días más en subirse. Pasada esta ventana se deja de revisar ese capítulo.
 const PROVIDER_RECHECK_MAX_AGE_MS = 4 * 24 * 60 * 60 * 1000;
+const AURORA_SYNC_INTERVAL_MS = 20 * 60 * 1000;
 
 // Cruza el bloque "Recientemente Actualizado" de la home de animeav1.com contra los animes de las
 // temporadas activas: si salió un episodio nuevo de algo que alguien está votando/siguiendo, avisa
@@ -92,6 +96,14 @@ function isInsideNotifyWindow(guildId) {
 // objeto serializable: el modo respaldo lo guarda tal cual y lo manda después, dentro de la ventana
 // horaria, sin volver a consultar el sitio (que a esa hora puede estar bloqueado).
 async function buildNotice(entry, av1Entry) {
+	// Guarda el id interno de animeav1 (si todavía no se conoce) para que watchServer.js pueda
+	// reconocer este anime cuando alguien vea un capítulo con el watcher de VLC o la extensión de
+	// Firefox - sin esto, un capítulo recién visto nunca se marca ("No reconozco ese anime").
+	if (getAv1MediaId(entry.malId) == null) {
+		const mediaId = await getMediaId(av1Entry.slug).catch(() => null);
+		if (mediaId) setAv1MediaId({ malId: entry.malId, av1MediaId: mediaId });
+	}
+
 	const dl = await getDownloadLinks(av1Entry.slug, av1Entry.episode).catch((err) => {
 		console.error(`[scheduler] "${entry.title}" ep. ${av1Entry.episode}: falló getDownloadLinks:`, err.message);
 		return null;
@@ -352,8 +364,13 @@ async function checkRecentEpisodes(client, seasonsToRepair) {
 
 	const noticeCache = new Map();
 	for (const av1Entry of updated) {
-		const matches = byTitle.get(normalizeTitle(av1Entry.title));
-		if (!matches) continue;
+		let matches = byTitle.get(normalizeTitle(av1Entry.title));
+		if (!matches) {
+			// Otro nombre en animeav1 que en MAL: cruzamos por el malId de su ficha.
+			const malId = await getMalIdBySlug(av1Entry.slug).catch(() => null);
+			matches = malId ? tracked.filter((t) => t.malId === malId) : null;
+			if (!matches?.length) continue;
+		}
 
 		for (const entry of matches) {
 			await processEpisode(client, entry, av1Entry, { seasonsToRepair, noticeCache });
@@ -456,6 +473,31 @@ async function checkForNewProviders(client) {
 	}
 }
 
+// Rellena, uno por uno, el av1MediaId de cualquier anime seguido que todavía no lo tenga - cubre lo
+// que el cruce de buildNotice (ver arriba) no llega a tocar porque su último capítulo ya se notificó
+// antes de que existiera esa resolución automática. Secuencial con pausa entre cada uno para no
+// golpear animeav1.com de una sentada; solo corre una vez al arrancar, no en cada chequeo periódico.
+async function backfillAv1MediaIds() {
+	const porMalId = new Map(getAllAnime().map((a) => [a.malId, a]));
+	const faltantes = [...porMalId.values()].filter((a) => getAv1MediaId(a.malId) == null);
+	if (faltantes.length === 0) return;
+
+	console.log(`[scheduler] resolviendo av1MediaId de ${faltantes.length} anime(s) sin mapear...`);
+	for (const anime of faltantes) {
+		try {
+			const slug = anime.slug ?? (await findSlugByTitle(anime.title));
+			const mediaId = slug ? await getMediaId(slug) : null;
+			if (mediaId) {
+				setAv1MediaId({ malId: anime.malId, av1MediaId: mediaId });
+				console.log(`[scheduler] av1MediaId de "${anime.title}" resuelto: ${mediaId}`);
+			}
+		} catch (err) {
+			console.error(`[scheduler] no pude resolver av1MediaId de "${anime.title}":`, err.message);
+		}
+		await new Promise((resolve) => setTimeout(resolve, 1000));
+	}
+}
+
 // Corre una vez al levantar el bot y luego cada 30 minutos.
 function startAv1EpisodeNotifier(client) {
 	console.log(`[scheduler] chequeo de animeav1 iniciado, va a chequear cada ${AV1_CHECK_INTERVAL_MS / 60_000} minutos`);
@@ -467,9 +509,17 @@ function startAv1EpisodeNotifier(client) {
 
 	ensureWarpOnStartup()
 		.catch((err) => console.error('[scheduler] falló la reconexión de WARP al arrancar:', err.message))
+		.then(() => backfillAv1MediaIds().catch((err) => console.error('[scheduler] falló el relleno de av1MediaId:', err.message)))
 		.then(runChecks);
 	setInterval(runChecks, AV1_CHECK_INTERVAL_MS);
 }
 
+// Corre una vez al levantar el bot y luego cada 20 minutos: trae los gifs de reacciones nuevos que
+// tenga Aurora (ver auroraSync.js — no hace nada si AURORA_DB_URL/AURORA_DB_TOKEN no están configuradas).
+function startAuroraGifSync() {
+	const tick = () => syncReactionGifs().catch((err) => console.error('[auroraSync] falló el sync de reactions:', err.message));
+	tick();
+	setInterval(tick, AURORA_SYNC_INTERVAL_MS);
+}
 
-module.exports = { startAv1EpisodeNotifier, checkAndNotifyAv1 };
+module.exports = { startAv1EpisodeNotifier, startAuroraGifSync, checkAndNotifyAv1 };

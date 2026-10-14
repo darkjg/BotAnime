@@ -268,6 +268,32 @@ async function obtenerOCrearWebhook(canalBase) {
 	return webhook;
 }
 
+// Discord consulta el link UNA vez al publicar el mensaje y no reintenta: si el sitio "fix" tarda
+// (típico de la primera petición con traducción) o falla puntualmente, el mensaje se queda como
+// link pelado aunque el link funcione un momento después. Pasados unos segundos se comprueba si
+// salió el embed y, si no, se quita y se vuelve a poner la supresión de embeds, lo que hace que
+// Discord vuelva a consultar el link. Se hace una sola vez por mensaje y sin bloquear nada.
+const ESPERA_REVISION_EMBED_MS = 3000;
+const esperar = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function reintentarEmbedSiFalta(mensaje) {
+	try {
+		await esperar(ESPERA_REVISION_EMBED_MS);
+		const actual = await mensaje.channel.messages.fetch(mensaje.id);
+		if (actual.embeds.length > 0) return;
+
+		console.log(`[linkFix] ${mensaje.id}: sin embed tras ${ESPERA_REVISION_EMBED_MS}ms, pido a Discord que lo regenere`);
+		await actual.suppressEmbeds(true);
+		await actual.suppressEmbeds(false);
+
+		await esperar(ESPERA_REVISION_EMBED_MS);
+		const despues = await mensaje.channel.messages.fetch(mensaje.id);
+		console.log(`[linkFix] ${mensaje.id}: tras el reintento ${despues.embeds.length > 0 ? 'ya tiene embed' : 'sigue sin embed'}`);
+	} catch {
+		// Mensaje borrado (🗑️), sin permisos o fallo de red: no hay nada más que hacer.
+	}
+}
+
 // Si el mensaje trae un link de un sitio soportado y /link-fix está activado en el servidor: borra
 // el original y lo reenvía como versión "fix" vía webhook con el nombre/avatar de quien lo escribió,
 // para que quede claro quién lo mandó sin que parezca dicho por el bot.
@@ -438,6 +464,9 @@ async function handleMessage(message) {
 			message.delete().catch(() => {}),
 		]);
 		marcar(`listo (reacción + borrado)`);
+
+		// Solo si se espera que Discord monte el embed solo (sin embeds ni galería propios).
+		if (embeds.length === 0 && adjuntos.length === 0) reintentarEmbedSiFalta(mensajeEnviado);
 	} catch (error) {
 		console.error('[linkFix] error al revisar el link:', error.message);
 	}

@@ -15,6 +15,8 @@ const {
 	getWatchersWithProgress,
 	getAnimeAcrossGuilds,
 	getDisplayTitle,
+	setEpisodesWatched,
+	getAv1ForumThread,
 } = require('./services/db');
 const { getAnime, rememberAnime, getSeasonLabel } = require('./seasonCache');
 const { handleSeasonSelect, handleSeasonConfirm } = require('./commands/temporadaShared');
@@ -390,10 +392,16 @@ async function handleEpisodeAmountModal(interaction, token) {
 		const channel = await interaction.client.channels.fetch(channelId);
 		await reabrirSiArchivado(channel);
 		const message = await channel.messages.fetch(messageId);
-		await message.edit({
-			embeds: [buildAnimeEmbed(anime, { voteState, progress })],
-			components: buildVoteRow(seasonLabel, malId, { voteState }),
-		});
+		// El botón "Actualizar capítulo" también vive en los avisos de animeav1 (canal y foro), que no
+		// llevan el embed de voto. Reescribirlos con buildAnimeEmbed/buildVoteRow los convertía en un
+		// post de voto completo; solo tiene sentido reconstruir así el post de voto real del hilo (su
+		// embed trae los campos de Episodios/Día/Estudio que arma buildAnimeEmbed).
+		if (message.embeds[0]?.fields?.length > 0) {
+			await message.edit({
+				embeds: [buildAnimeEmbed(anime, { voteState, progress })],
+				components: buildVoteRow(seasonLabel, malId, { voteState }),
+			});
+		}
 	} catch (err) {
 		console.error('[interactions] no pude actualizar el mensaje del hilo tras actualizar el capítulo:', err.message);
 	}
@@ -405,6 +413,80 @@ async function handleEpisodeAmountModal(interaction, token) {
 		withoutRole?.length > 0 ? ` (sin actualizar por ya no votar este anime: ${withoutRole.map((u) => `**${u.displayName}**`).join(', ')})` : '';
 	await interaction.editReply(`Listo: ${delta > 0 ? '+' : ''}${delta} capítulo(s) para ${names} en **${animeTitle}**.${skippedNote}${textoFallosSheet(fallidos)}`);
 	autoCleanupReply(interaction);
+}
+
+// Botón "Yo también lo vi" que watchServer.js ofrece al resto del canal de voz cuando alguien marca
+// un capítulo con el vigilante de VLC o la extensión de Firefox (ver src/watchServer.js) - a
+// diferencia del marcado automático que había antes, acá cada quien tiene que confirmarlo él mismo
+// con un clic, así no se marca a quien estaba en el canal sin estar mirando el capítulo.
+async function handleWatchConfirmButton(interaction, seasonSlug, malId, episode) {
+	// Lo que sigue escribe en Sheets y edita el embed del hilo, que puede tardar más de los 3
+	// segundos que da Discord para responder sin deferir (mismo motivo que /capitulo, ver
+	// handleEpisodeAmountModal) - sin esto, Discord daba la interacción por caída aunque el capítulo
+	// sí se marcara igual (visto en vivo: "BotAnimu no ha respondido a tiempo").
+	await interaction.deferReply({ ephemeral: true });
+
+	const seasonLabel = getSeasonLabel(seasonSlug);
+	const malIdNum = Number(malId);
+	const [anime] = seasonLabel ? getAnimeAcrossGuilds({ seasonLabel, malId: malIdNum }) : [];
+	if (!seasonLabel || !anime) {
+		await interaction.editReply('Esto ya expiró (¿se reinició el bot?).');
+		autoCleanupReply(interaction);
+		return;
+	}
+
+	const vote = getUserVote({ seasonLabel, malId: malIdNum, discordId: interaction.user.id });
+	if (!vote || vote.voteType === 'rojo') {
+		await interaction.editReply('No tienes voto registrado para este anime, así que no hay nada que marcarte.');
+		autoCleanupReply(interaction);
+		return;
+	}
+
+	const episodesWatched = setEpisodesWatched({
+		seasonLabel,
+		malId: malIdNum,
+		discordId: interaction.user.id,
+		displayName: interaction.member.displayName,
+		episodesWatched: Number(episode),
+	});
+
+	const resultado = await refrescarCeldaDeProgreso({ seasonLabel, malId: malIdNum, displayName: interaction.member.displayName, voteType: vote.voteType, episodesWatched });
+	if (!resultado.ok) {
+		console.error(`[interactions] no pude refrescar la celda de "${interaction.member.displayName}" en la sheet:`, resultado.error.message);
+	}
+
+	const threadId = getAv1ForumThread({ guildId: interaction.guildId, seasonLabel, malId: malIdNum });
+	if (threadId) {
+		try {
+			const thread = await interaction.client.channels.fetch(threadId);
+			await reabrirSiArchivado(thread);
+			const message = await thread.messages.fetch(threadId);
+			const voteState = getVoteState({ seasonLabel, malId: malIdNum });
+			const progress = getWatchersWithProgress({ seasonLabel, malId: malIdNum });
+			await message.edit({
+				embeds: [buildAnimeEmbed(anime, { voteState, progress })],
+				components: buildVoteRow(seasonLabel, malIdNum, { voteState }),
+			});
+		} catch (err) {
+			console.error(`[interactions] no pude actualizar el embed del hilo tras la confirmación de "${interaction.member.displayName}":`, err.message);
+		}
+	}
+
+	console.log(`[interactions] ${interaction.member.displayName} confirmó "yo también lo vi" para "${getDisplayTitle(anime)}" cap. ${episode}`);
+	await interaction.editReply(`Listo, quedaste en el capítulo ${episodesWatched} de **${getDisplayTitle(anime)}**.`);
+	autoCleanupReply(interaction);
+
+	// El mensaje con el botón se queda en el canal hasta que confirme el último que faltaba (ver
+	// watchServer.js, que arma esta lista de pendientes) - al quitar a este ya no queda nadie más, se
+	// borra solo.
+	const pendientes = interaction.client.watchConfirmPending?.get(interaction.message.id);
+	if (pendientes) {
+		pendientes.delete(interaction.user.id);
+		if (pendientes.size === 0) {
+			interaction.client.watchConfirmPending.delete(interaction.message.id);
+			await interaction.message.delete().catch(() => {});
+		}
+	}
 }
 
 async function handleTrailerButton(interaction, malId) {
@@ -494,6 +576,9 @@ async function handleInteraction(interaction) {
 			await handleAv1WarpButton(interaction, rest[0]);
 		} else if (kind === 'remindercancel') {
 			await handleReminderCancelButton(interaction, rest[0]);
+		} else if (kind === 'watchconfirm') {
+			const [seasonSlug, malId, episode] = rest;
+			await handleWatchConfirmButton(interaction, seasonSlug, malId, episode);
 		}
 		return;
 	}

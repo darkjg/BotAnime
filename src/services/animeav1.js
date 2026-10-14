@@ -73,13 +73,54 @@ async function getCoverImage(slug) {
 	return match?.[1] ?? null;
 }
 
+// El id interno de animeav1 (NO el slug) — no sale en ninguna URL visible, pero viene embebido en el
+// bloque de datos de SvelteKit de la propia ficha: media:{id:197,categoryId:1,title:"One Piece",...}.
+// Sirve para identificar qué anime es un archivo descargado de animeav1: el nombre que deja al
+// descargar un capítulo es "<id>_<capitulo>_SUB" (o _DUB), sin el título — comprobado en vivo
+// 2026-10-05 con One Piece (id 197) y Youjo Senki II (id 4417). No hay otra forma de sacar este id
+// más que leerlo de la ficha, así que se guarda en BD la primera vez (ver setAv1MediaId) para no
+// tener que volver a pedirlo.
+const MEDIA_ID_RE = /media:\{id:(\d+),categoryId:\d+,title:"/;
+
+async function getMediaId(slug) {
+	const res = await av1Fetch(`https://animeav1.com/media/${slug}`);
+	if (!res.ok) return null;
+	const html = await res.text();
+	const match = html.match(MEDIA_ID_RE);
+	return match ? Number(match[1]) : null;
+}
+
+// La ficha trae el malId del propio anime (`...",malId:63431,seasons:`); los de los géneros van seguidos de `}`.
+// Sirve para cruzar animes que animeav1 lista con otro nombre que MAL (ej. "Chii Fuyo"). Cacheado por slug.
+const MAL_ID_RE = /,malId:(\d+),seasons:/;
+const malIdCache = new Map();
+
+async function getMalIdBySlug(slug) {
+	if (malIdCache.has(slug)) return malIdCache.get(slug);
+	const res = await av1Fetch(`https://animeav1.com/media/${slug}`);
+	if (!res.ok) return null; // sin cachear: puede ser un fallo pasajero
+	const match = (await res.text()).match(MAL_ID_RE);
+	const malId = match ? Number(match[1]) : null;
+	malIdCache.set(slug, malId);
+	return malId;
+}
+
+// Slug de un anime en emisión que animeav1 lista con otro nombre que MAL: recorre "Recientemente
+// Actualizado" y se queda con la ficha cuyo malId coincide. null si no aparece ahí.
+async function findSlugByMalId(malId) {
+	for (const entry of await getRecentlyUpdatedEpisodes()) {
+		if ((await getMalIdBySlug(entry.slug)) === Number(malId)) return entry.slug;
+	}
+	return null;
+}
+
 // Igual que ENTRY_RE pero para las tarjetas del catálogo/buscador (/media/<slug>, sin episodio).
 const SEARCH_ENTRY_RE = /href="\/media\/([a-z0-9-]+)"><span class="sr-only">Ver ([^<]+)<\/span>/g;
 
 // El catálogo no expone los animes por malId, así que para resolver el slug de un anime que todavía
 // no vimos pasar por "Recientemente Actualizado" usamos el buscador del sitio (?search=<título>) y
-// nos quedamos con el resultado cuyo título normalizado coincide EXACTO con el buscado. Preferimos
-// no encontrar nada a devolver el slug de otro anime parecido.
+// nos quedamos con el resultado cuyo título normalizado coincide con el buscado. Preferimos no
+// encontrar nada a devolver el slug de otro anime parecido.
 async function findSlugByTitle(title) {
 	const res = await av1Fetch(`https://animeav1.com/catalogo?search=${encodeURIComponent(title)}`);
 	if (!res.ok) return null;
@@ -88,10 +129,17 @@ async function findSlugByTitle(title) {
 	const target = normalizeTitle(title);
 	SEARCH_ENTRY_RE.lastIndex = 0;
 	let match;
+	const porPrefijo = [];
 	while ((match = SEARCH_ENTRY_RE.exec(html))) {
-		if (normalizeTitle(match[2]) === target) return match[1];
+		const candidato = normalizeTitle(match[2]);
+		if (candidato === target) return match[1];
+		// Nuestro título suele venir de MAL, recortado, sin el subtítulo largo que usa animeav1 (ej.
+		// "Kyouran Reijou Nia Liston" vs "Kyouran Reijou Nia Liston: Byoujaku Reijou ni Tensei..."):
+		// si el buscado es prefijo exacto por palabra del candidato, lo aceptamos como segunda opción,
+		// pero solo si es el único - con dos o más preferimos no adivinar cuál es.
+		if (candidato.startsWith(`${target} `)) porPrefijo.push(match[1]);
 	}
-	return null;
+	return porPrefijo.length === 1 ? porPrefijo[0] : null;
 }
 
 function uniqByUrl(items) {
@@ -179,4 +227,4 @@ async function getDownloadLinks(slug, episode) {
 }
 
 
-module.exports = { getRecentlyUpdatedEpisodes, normalizeTitle, getCoverImage, getDownloadLinks, findSlugByTitle };
+module.exports = { getRecentlyUpdatedEpisodes, normalizeTitle, getCoverImage, getDownloadLinks, findSlugByTitle, getMediaId, getMalIdBySlug, findSlugByMalId };

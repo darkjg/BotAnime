@@ -168,6 +168,40 @@ CREATE TABLE IF NOT EXISTS av1_pending_notices (
   PRIMARY KEY (guildId, seasonLabel, malId, episode)
 ) STRICT;
 
+-- Copia local de los gifs de reacciones (/reaccion) sincronizados desde la base de otro bot, Aurora
+-- (ver auroraSync.js). Mismo esquema que la tabla reaction_gifs real de Aurora: el PRIMARY KEY
+-- (accion, url) es lo que garantiza que un sync nunca inserte un gif duplicado, sin necesitar
+-- rastrear "qué es nuevo" a mano (Aurora no tiene columna de fecha/id para eso).
+CREATE TABLE IF NOT EXISTS reaction_gifs (
+  accion  TEXT NOT NULL,
+  url     TEXT NOT NULL,
+  PRIMARY KEY (accion, url)
+) STRICT;
+CREATE INDEX IF NOT EXISTS idx_reaction_gifs_accion ON reaction_gifs(accion);
+
+-- Además de URLs, Aurora tiene reacciones con archivos subidos directo al dashboard (no quedan en
+-- reaction_gifs, solo en el filesystem del lado de Aurora — ver auroraSync.js). Se guardan acá como
+-- base64 en la propia base (a diferencia de reaction_gifs, no hay una URL pública para mostrar, hay
+-- que mandarlos como adjunto de Discord).
+CREATE TABLE IF NOT EXISTS reaction_gif_files (
+  accion    TEXT NOT NULL,
+  fileName  TEXT NOT NULL,
+  mimeType  TEXT NOT NULL,
+  data      TEXT NOT NULL,
+  PRIMARY KEY (accion, fileName)
+) STRICT;
+CREATE INDEX IF NOT EXISTS idx_reaction_gif_files_accion ON reaction_gif_files(accion);
+
+-- Qué tan reciente es la última vez que se revisaron los archivos locales de una acción (aparte de las
+-- URLs, que se sincronizan enteras cada vez porque son baratas). Revisar archivos implica un pedido
+-- HTTP aparte por acción (Aurora lee su filesystem y base64-codifica cada archivo, ver
+-- listReactionGifsFull en BotQueryServer.js) — no conviene hacerlo para las ~90+ acciones en cada
+-- sync, así que cada vuelta se revisa solo un lote chico, empezando por las menos revisadas.
+CREATE TABLE IF NOT EXISTS reaction_file_sync_state (
+  accion         TEXT PRIMARY KEY,
+  lastCheckedAt  INTEGER NOT NULL DEFAULT 0
+) STRICT;
+
 -- Apodo de un anime (/apodo), por malId — NO por temporada/guild: un apodo puesto una vez sigue
 -- aplicando aunque el anime vuelva en otra temporada (carryover) o vuelva a votarse más adelante.
 -- Deliberadamente separado de anime.title: ese campo lo sigue usando el cruce contra animeav1.com
@@ -179,6 +213,30 @@ CREATE TABLE IF NOT EXISTS anime_nicknames (
   nickname  TEXT NOT NULL,
   setBy     TEXT,
   setAt     INTEGER NOT NULL
+) STRICT;
+
+-- Id interno de animeav1 por malId (ver getMediaId en animeav1.js) — NO sale en ninguna URL, solo en
+-- el bloque de datos de la ficha, así que se guarda la primera vez que se pide en vez de releerlo
+-- siempre. Sirve para identificar qué anime es un archivo descargado de animeav1 a partir de su
+-- nombre de archivo ("<av1MediaId>_<capitulo>_SUB"), sin depender de que el nombre tenga el título.
+CREATE TABLE IF NOT EXISTS av1_media_ids (
+  malId       INTEGER PRIMARY KEY,
+  av1MediaId  INTEGER NOT NULL UNIQUE
+) STRICT;
+
+-- Token personal por persona para el vigilante de VLC (ver watchServer.js y /vlc-watcher-token): su
+-- programa local, corriendo en SU PC (no en la LAN del bot), lo manda por HTTPS público para decir
+-- "acabo de ver tal capítulo". El token es lo único que demuestra quién es sin pedirle login de
+-- Discord de verdad — por eso es largo y aleatorio, no un PIN corto.
+CREATE TABLE IF NOT EXISTS watch_tokens (
+  discordId     TEXT PRIMARY KEY,
+  token         TEXT NOT NULL UNIQUE,
+  createdAt     INTEGER NOT NULL,
+  -- Si está en 1, cuando esta persona marque un capítulo visto sin estar conectada a ningún canal
+  -- de voz (ver watchServer.js), el aviso de cortesía le llega por DM en vez de publicarse (aunque
+  -- sea un segundo) en el canal de avisos del server. Por defecto 0: se mantiene el comportamiento
+  -- de siempre, publicar en el canal.
+  avisoPrivado  INTEGER NOT NULL DEFAULT 0
 ) STRICT;
 
 -- Conteo de partidas de Yumi (LoL) de pegu (/yumi): una fila por partida, así se puede deshacer la
@@ -217,6 +275,11 @@ function applySchema(db) {
 	// arriba: se añade a mano una vez, y en los arranques siguientes ya está y esto no hace nada.
 	const columnasReminders = db.prepare('PRAGMA table_info(reminders)').all().map((c) => c.name);
 	if (!columnasReminders.includes('repeatEveryMs')) db.exec('ALTER TABLE reminders ADD COLUMN repeatEveryMs INTEGER');
+
+	// Mismo caso: watch_tokens ya existía (desde antes de la preferencia de aviso privado) en la base de
+	// la Pi sin esta columna.
+	const columnasWatchTokens = db.prepare('PRAGMA table_info(watch_tokens)').all().map((c) => c.name);
+	if (!columnasWatchTokens.includes('avisoPrivado')) db.exec('ALTER TABLE watch_tokens ADD COLUMN avisoPrivado INTEGER NOT NULL DEFAULT 0');
 }
 
 module.exports = { SCHEMA_SQL, applySchema };

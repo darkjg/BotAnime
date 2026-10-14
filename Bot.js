@@ -23,9 +23,11 @@ const quedada = require('./src/commands/quedada');
 const yumi = require('./src/commands/yumi');
 const quitarUsuario = require('./src/commands/quitarUsuario');
 const limpiarNombreHoja = require('./src/commands/limpiarNombreHoja');
+const vlcWatcherToken = require('./src/commands/vlcWatcherToken');
+const { startWatchServer } = require('./src/watchServer');
 
 const { handleInteraction } = require('./src/interactions');
-const { startAv1EpisodeNotifier } = require('./src/scheduler');
+const { startAv1EpisodeNotifier, startAuroraGifSync } = require('./src/scheduler');
 const { startQuedadasNotifier } = require('./src/quedadasService');
 const { startRemindersNotifier } = require('./src/remindersService');
 const { handleMessage: handleLinkFixMessage, handleReactionAdd: handleLinkFixReaction } = require('./src/linkFixService');
@@ -34,8 +36,11 @@ const { conServidor } = require('./src/services/sheetTarget');
 // GuildMessages + MessageContent hacen falta para leer el texto de los mensajes (link de twitter/x a
 // arreglar); MessageContent es un intent privilegiado, hay que habilitarlo en el Developer Portal del
 // bot (Bot > Message Content Intent) o el login falla. GuildMessageReactions es para la reacción 🗑️
-// que deshace el reemplazo. Los partials son necesarios porque esa reacción puede llegar sobre un
-// mensaje que el cliente no tiene en caché (recién reiniciado el bot, por ejemplo).
+// que deshace el reemplazo. GuildVoiceStates es para saber quién está en qué canal de voz (lo usa
+// watchServer.js para ofrecer el botón "yo también lo vi" al resto del canal) - sin este intent,
+// member.voice.channel sale siempre vacío aunque la persona sí esté conectada. Los partials son
+// necesarios porque esa reacción puede llegar sobre un mensaje que el cliente no tiene en caché
+// (recién reiniciado el bot, por ejemplo).
 const client = new Client({
 	intents: [
 		GatewayIntentBits.Guilds,
@@ -43,6 +48,7 @@ const client = new Client({
 		GatewayIntentBits.GuildMessages,
 		GatewayIntentBits.MessageContent,
 		GatewayIntentBits.GuildMessageReactions,
+		GatewayIntentBits.GuildVoiceStates,
 	],
 	partials: [Partials.Message, Partials.Channel, Partials.Reaction],
 });
@@ -70,6 +76,7 @@ client.commands.set(quedada.data.name, quedada);
 client.commands.set(yumi.data.name, yumi);
 client.commands.set(quitarUsuario.data.name, quitarUsuario);
 client.commands.set(limpiarNombreHoja.data.name, limpiarNombreHoja);
+client.commands.set(vlcWatcherToken.data.name, vlcWatcherToken);
 
 
 
@@ -95,8 +102,10 @@ client.once('clientReady', () => {
 	clearTimeout(loginWatchdog);
 	console.log(`Conectado como ${client.user.tag}`);
 	startAv1EpisodeNotifier(client);
+	startAuroraGifSync();
 	startQuedadasNotifier(client);
 	startRemindersNotifier(client);
+	startWatchServer(client);
 	pushKumaHeartbeat();
 	setInterval(pushKumaHeartbeat, KUMA_PUSH_INTERVAL_MS);
 });

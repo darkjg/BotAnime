@@ -1,5 +1,6 @@
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const { DatabaseSync } = require('node:sqlite');
 const { applySchema } = require('./dbSchema');
 
@@ -88,6 +89,16 @@ function getAllAnime() {
 const selectAnimeAcrossGuildsStmt = db.prepare(`SELECT * FROM anime WHERE seasonLabel = ? AND malId = ?`);
 function getAnimeAcrossGuilds({ seasonLabel, malId }) {
 	return selectAnimeAcrossGuildsStmt.all(seasonLabel, malId).map(animeRowToObject);
+}
+
+// En qué temporadas este guild en particular tiene registrado este anime (más reciente primero). A
+// diferencia de getAnimeAcrossGuilds (todas las guilds, una temporada), esto es "todas las temporadas
+// de UNA guild" - lo usa watchServer para no confundir la temporada activa con alguna donde este guild
+// nunca llegó a trackear el anime (una guild puede tener una fila huérfana de una temporada a la que
+// el anime no terminó entrando, de un carryover corregido después en otra guild).
+const selectAnimeSeasonsForGuildStmt = db.prepare(`SELECT seasonLabel FROM anime WHERE guildId = ? AND malId = ? ORDER BY rowid DESC`);
+function getAnimeSeasonsForGuild({ guildId, malId }) {
+	return selectAnimeSeasonsForGuildStmt.all(guildId, malId).map((row) => row.seasonLabel);
 }
 
 // --- temporadas (seasons) -------------------------------------------------------------------------
@@ -626,6 +637,63 @@ function collectDueEpisodeLinkChecks(maxAgeMs) {
 	return selectDueEpisodeLinkMessagesStmt.all(cutoff).map((row) => ({ ...row, providers: JSON.parse(row.providers), hasErai: Boolean(row.hasErai) }));
 }
 
+// --- reactionGifs (sincronizados desde Aurora, ver auroraSync.js) ----------------------------------
+
+const insertReactionGifStmt = db.prepare(`INSERT OR IGNORE INTO reaction_gifs (accion, url) VALUES (?, ?)`);
+// El PRIMARY KEY (accion, url) es quien garantiza que nunca se duplique, no esta función: solo hace
+// falta el valor de retorno para poder loguear cuántos gifs son realmente nuevos en cada sync.
+function addReactionGif({ accion, url }) {
+	return insertReactionGifStmt.run(accion, url).changes > 0;
+}
+
+const selectReactionGifsForActionStmt = db.prepare(`SELECT url FROM reaction_gifs WHERE accion = ?`);
+function getReactionGifsForAction(accion) {
+	return selectReactionGifsForActionStmt.all(accion).map((row) => row.url);
+}
+
+// Unión con reaction_gif_files: una acción puede tener SOLO archivos locales (sin ninguna URL todavía,
+// ej. una reacción custom recién creada con un gif subido directo al dashboard) y aun así debe
+// aparecer en el autocomplete de /reaccion.
+const selectReactionActionsStmt = db.prepare(`
+	SELECT accion FROM reaction_gifs
+	UNION
+	SELECT accion FROM reaction_gif_files
+	ORDER BY accion
+`);
+function getReactionActions() {
+	return selectReactionActionsStmt.all().map((row) => row.accion);
+}
+
+const insertReactionGifFileStmt = db.prepare(`INSERT OR IGNORE INTO reaction_gif_files (accion, fileName, mimeType, data) VALUES (?, ?, ?, ?)`);
+function addReactionGifFile({ accion, fileName, mimeType, data }) {
+	return insertReactionGifFileStmt.run(accion, fileName, mimeType, data).changes > 0;
+}
+
+const selectReactionGifFilesForActionStmt = db.prepare(`SELECT fileName, mimeType, data FROM reaction_gif_files WHERE accion = ?`);
+function getReactionGifFilesForAction(accion) {
+	return selectReactionGifFilesForActionStmt.all(accion);
+}
+
+const upsertFileCheckCandidateStmt = db.prepare(`INSERT OR IGNORE INTO reaction_file_sync_state (accion, lastCheckedAt) VALUES (?, 0)`);
+// Registra una acción como "candidata" a que le revisemos archivos locales (aparte de las URLs) — no
+// hace nada si ya estaba (no reinicia su lastCheckedAt, así no vuelve a quedar primera en la cola).
+function registerReactionActionCandidate(accion) {
+	upsertFileCheckCandidateStmt.run(accion);
+}
+
+const selectActionsDueForFileCheckStmt = db.prepare(`SELECT accion FROM reaction_file_sync_state ORDER BY lastCheckedAt ASC LIMIT ?`);
+// Las acciones menos revisadas recientemente primero: con esto, con el tiempo se termina revisando
+// todas (incluidas las nuevas, que arrancan en lastCheckedAt=0) sin tener que golpear el servidor de
+// Aurora con un pedido por CADA acción en cada sync (ver AURORA_FILE_CHECK_BATCH_SIZE en auroraSync.js).
+function getActionsDueForFileCheck(limit) {
+	return selectActionsDueForFileCheckStmt.all(limit).map((row) => row.accion);
+}
+
+const markActionFileCheckedStmt = db.prepare(`UPDATE reaction_file_sync_state SET lastCheckedAt = ? WHERE accion = ?`);
+function markActionFileChecked(accion) {
+	markActionFileCheckedStmt.run(Date.now(), accion);
+}
+
 // --- anime_nicknames (/apodo) --------------------------------------------------------------------
 
 const upsertAnimeNicknameStmt = db.prepare(`
@@ -654,6 +722,68 @@ function getAnimeNickname(malId) {
 // en scheduler.js) necesita el título real para emparejar, no el apodo.
 function getDisplayTitle(anime) {
 	return getAnimeNickname(anime.malId) ?? anime.title;
+}
+
+// --- av1_media_ids (identificar anime por el nombre de archivo al descargar de animeav1) ----------
+
+const upsertAv1MediaIdStmt = db.prepare(`
+	INSERT INTO av1_media_ids (malId, av1MediaId) VALUES (?, ?)
+	ON CONFLICT (malId) DO UPDATE SET av1MediaId = excluded.av1MediaId
+`);
+function setAv1MediaId({ malId, av1MediaId }) {
+	upsertAv1MediaIdStmt.run(malId, av1MediaId);
+}
+
+const selectAv1MediaIdStmt = db.prepare(`SELECT av1MediaId FROM av1_media_ids WHERE malId = ?`);
+function getAv1MediaId(malId) {
+	return selectAv1MediaIdStmt.get(malId)?.av1MediaId ?? null;
+}
+
+// Sentido inverso: de "este archivo descargado tiene el id de animeav1 X" a "es este malId" — lo que
+// hace falta para identificar qué anime se está viendo en VLC a partir del nombre del archivo.
+const selectMalIdByAv1MediaIdStmt = db.prepare(`SELECT malId FROM av1_media_ids WHERE av1MediaId = ?`);
+function getMalIdByAv1MediaId(av1MediaId) {
+	return selectMalIdByAv1MediaIdStmt.get(av1MediaId)?.malId ?? null;
+}
+
+// --- watch_tokens (vigilante de VLC, /vlc-watcher-token) --------------------------------------------
+
+const selectWatchTokenByDiscordIdStmt = db.prepare(`SELECT token FROM watch_tokens WHERE discordId = ?`);
+const insertWatchTokenStmt = db.prepare(`INSERT INTO watch_tokens (discordId, token, createdAt) VALUES (?, ?, ?)`);
+// Siempre devuelve el MISMO token para la misma persona si ya tenía uno (no lo pisa) — así el
+// programa de su PC solo necesita pedirlo una vez; volver a correr el comando no invalida el que ya
+// tiene guardado. Para invalidarlo de verdad hace falta regenerateWatchToken.
+function getOrCreateWatchToken(discordId) {
+	const existente = selectWatchTokenByDiscordIdStmt.get(discordId)?.token;
+	if (existente) return existente;
+	const token = crypto.randomBytes(24).toString('base64url');
+	insertWatchTokenStmt.run(discordId, token, Date.now());
+	return token;
+}
+
+const deleteWatchTokenStmt = db.prepare(`DELETE FROM watch_tokens WHERE discordId = ?`);
+// Invalida el token viejo (si alguien cree que se filtró) y entrega uno nuevo — el programa de esa
+// persona tendría que volver a configurarse con el nuevo.
+function regenerateWatchToken(discordId) {
+	deleteWatchTokenStmt.run(discordId);
+	return getOrCreateWatchToken(discordId);
+}
+
+const selectDiscordIdByTokenStmt = db.prepare(`SELECT discordId FROM watch_tokens WHERE token = ?`);
+function getDiscordIdForWatchToken(token) {
+	return selectDiscordIdByTokenStmt.get(token)?.discordId ?? null;
+}
+
+const selectAvisoPrivadoStmt = db.prepare(`SELECT avisoPrivado FROM watch_tokens WHERE discordId = ?`);
+function getAvisoPrivadoPreference(discordId) {
+	return selectAvisoPrivadoStmt.get(discordId)?.avisoPrivado === 1;
+}
+
+const updateAvisoPrivadoStmt = db.prepare(`UPDATE watch_tokens SET avisoPrivado = ? WHERE discordId = ?`);
+// Requiere que ya exista fila (token pedido antes) - no tiene sentido fijar la preferencia de alguien
+// que nunca pidió su token para el vigilante de VLC.
+function setAvisoPrivadoPreference({ discordId, avisoPrivado }) {
+	updateAvisoPrivadoStmt.run(avisoPrivado ? 1 : 0, discordId);
 }
 
 // --- yumi_games (/yumi) --------------------------------------------------------------------------
@@ -805,6 +935,7 @@ module.exports = {
 
 	getAllAnime,
 	getAnimeAcrossGuilds,
+	getAnimeSeasonsForGuild,
 	getVotesForSeason,
 	setActiveSeason,
 	getActiveSeason,
@@ -813,8 +944,24 @@ module.exports = {
 	recordSeasonHistory,
 	getPreviousSeasonLabel,
 
+	addReactionGif,
+	getReactionGifsForAction,
+	getReactionActions,
+	addReactionGifFile,
+	getReactionGifFilesForAction,
+	registerReactionActionCandidate,
+	getActionsDueForFileCheck,
+	markActionFileChecked,
 
 	setAnimeNickname,
 	getAnimeNickname,
+	setAv1MediaId,
+	getAv1MediaId,
+	getMalIdByAv1MediaId,
+	getOrCreateWatchToken,
+	regenerateWatchToken,
+	getDiscordIdForWatchToken,
+	getAvisoPrivadoPreference,
+	setAvisoPrivadoPreference,
 	getDisplayTitle,
 };
