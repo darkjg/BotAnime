@@ -182,7 +182,7 @@ async function marcarCapituloParaCanal({ client, discordId, av1MediaId, title, e
 					),
 				];
 			}
-			const mensaje = await canal.send({ content: texto, components });
+			const mensaje = await canal.send({ content: texto, components, allowedMentions: { parse: [] } });
 
 			if (otros.length === 0) {
 				// Nadie más a quien esperar: se autoborra rápido, es solo una confirmación de cortesía.
