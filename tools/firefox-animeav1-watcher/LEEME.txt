@@ -1,0 +1,45 @@
+AnimeAV1 Watcher — marca solo los capítulos que ves EN STREAMING en animeav1.com
+=================================================================================
+
+¿Qué hace? Igual que el vigilante de VLC (../vlc-watcher), pero para cuando ves el capítulo
+directamente en la web de animeav1.com en vez de descargarlo: al llegar casi al final, avisa al bot
+de Discord para que te marque ese capítulo como visto a ti (y a quien esté contigo en tu mismo canal
+de voz que también siga ese anime).
+
+Solo funciona con el servidor "HLS" (el que carga por defecto al abrir un capítulo) y, si el
+servidor en cuestión usa un reproductor de vídeo normal, también con UPNShare/Voe/Byse/MP4Upload -
+confirmado que HLS sí funciona; los demás no se han probado en vivo.
+
+PASO 1 — Consigue tu token (en Discord)
+----------------------------------------
+Escribe /vlc-watcher-token en el servidor (el mismo token sirve para esto y para el vigilante de
+VLC, no hace falta pedir uno nuevo si ya tienes uno).
+
+PASO 2 — Instala la extensión en Firefox
+-------------------------------------------
+Como no está firmada por Mozilla, se instala "temporalmente" (dura hasta que cierras Firefox; hay
+que repetir esto cada vez que lo abras, o ver más abajo cómo dejarlo instalado para siempre):
+  1. Abre about:debugging#/runtime/this-firefox
+  2. "Cargar complemento temporal..."
+  3. Elige el archivo manifest.json de esta carpeta.
+
+Para que quede instalada sin tener que repetir esto cada vez que abras Firefox, hace falta firmarla
+(gratis) en https://addons.mozilla.org/developers/ como "unlisted" y luego instalar el .xpi firmado
+que te den - o usar Firefox Developer Edition/Nightly, que permiten desactivar la firma obligatoria.
+
+PASO 3 — Pega tu token
+-------------------------
+Clic en el icono de la extensión (al lado de la barra de direcciones) y pega el token del paso 1.
+
+Listo. Mientras veas un capítulo en https://animeav1.com/media/.../..., al llegar casi al final se
+marca solo - sin recargar la página ni tocar nada en Discord.
+
+Notas
+-----
+- No hace falta estar en un canal de voz: si no lo estás, se marca solo para ti. Si estás en uno con
+  más gente que también sigue ese anime, el bot les ofrece un botón para que cada uno confirme que
+  también lo vio (no se marca automático).
+- Si el bot no responde (sin red, caído...) no pasa nada: se reintenta solo en el siguiente segundo
+  que pase por encima del 90% del capítulo.
+- Para ver qué está haciendo: about:debugging#/runtime/this-firefox > esta extensión > "Inspeccionar"
+  (consola del background) muestra los avisos mandados/recibidos.

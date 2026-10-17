@@ -1,0 +1,64 @@
+VlcWatcher — marca solo los capítulos de anime que ves en VLC
+================================================================
+
+¿Qué hace? Cuando terminas de ver, en VLC, un capítulo descargado de animeav1.com o un release de
+Erai-raws (torrent) — en ambos casos sin renombrar el archivo —, avisa al bot de Discord para que te
+marque ese capítulo como visto: a ti, y a quien esté contigo en tu mismo canal de voz de Discord que
+también siga ese anime. No hace falta tocar nada en Discord cada vez: una vez configurado, corre
+como servicio de Windows en segundo plano, arranca solo y se reinicia solo si se llega a caer.
+
+PASO 1 — Consigue tu token (en Discord)
+----------------------------------------
+Escribe el comando /vlc-watcher-token en el servidor. Te contestará con un código largo, privado
+(solo lo ves tú). Cópialo — lo necesitarás en el paso 3. No se lo pases a nadie: con eso el bot
+cree que eres tú.
+
+PASO 2 — Activa la interfaz web de VLC (una sola vez)
+-------------------------------------------------------
+1. Abre VLC > Herramientas > Preferencias.
+2. Abajo a la izquierda, cambia "Mostrar ajustes" a "Todos".
+3. En el panel de la izquierda: Interfaz > Interfaces principales > marca la casilla "Web".
+4. Busca "lua" en el buscador de arriba del todo de Preferencias y entra en "Intérprete Lua" >
+   en "Contraseña Lua HTTP" pon una contraseña cualquiera (la que quieras, apúntala) — es
+   obligatoria, VLC rechaza las conexiones si se deja en blanco. La necesitarás en el paso 3.
+5. Guarda, y cierra VLC del todo (que no quede ni en la bandeja del sistema) y vuelve a abrirlo
+   para que tome el cambio — no basta con guardar mientras ya estaba abierto.
+
+PASO 3 — Ejecuta VlcWatcher.exe (configuración)
+-------------------------------------------------
+Doble clic en VlcWatcher.exe. La primera vez te pedirá:
+  - El token del paso 1 (pégalo y pulsa Enter).
+  - La contraseña de VLC del paso 2 (escríbela y pulsa Enter).
+
+Con eso queda guardado en "config.json" (junto al .exe). Esta ventana se cierra sola a los
+8 segundos — todavía no está vigilando nada, falta el paso 4.
+
+PASO 4 — Instálalo como servicio (una sola vez)
+---------------------------------------------------
+Así se queda corriendo siempre, incluso si lo cierras sin querer o si reinicias el PC antes de
+iniciar sesión — Windows lo reinicia solo si se llega a caer.
+
+1. Busca "cmd" o "PowerShell" en el menú de inicio, clic derecho > "Ejecutar como administrador".
+2. Ve a la carpeta de VlcWatcher.exe (ej. cd "C:\ruta\a\la\carpeta") y ejecuta:
+     .\VlcWatcher.exe -install-service
+3. Te va a pedir confirmar permisos de administrador (UAC) — acepta. Con eso queda instalado,
+   arrancado, y configurado para levantarse solo si se cae.
+
+Para quitarlo (desde una consola de administrador también): .\VlcWatcher.exe -uninstall-service
+Para ver los logs en vivo en una ventana en vez de en segundo plano: .\VlcWatcher.exe -debug
+
+Listo. Mientras veas anime con VLC (de un archivo descargado de animeav1 o de un release de
+Erai-raws, en ambos casos sin renombrar), al llegar casi al final del capítulo se marca solo.
+
+Notas
+-----
+- Si cambias la contraseña de VLC más adelante: abre "Servicios" (búscalo en el menú de inicio),
+  busca "VlcWatcher - BotAnime" en la lista, clic derecho > Detener. Borra "config.json", ejecuta
+  el .exe una vez para que te pida los datos de nuevo, y en "Servicios" otra vez, clic derecho >
+  Iniciar.
+- Los releases de Erai-raws no traen un id propio como animeav1: se reconoce el anime cruzando el
+  título del archivo contra los animes que sigues en el bot. Si el título no coincide (traducción
+  distinta, etc), ese capítulo no se reconoce.
+- Si no estás en ningún canal de voz cuando termina el capítulo, se marca solo para ti. Si estás
+  en un canal con más gente que también sigue ese anime, el bot les ofrece un botón para que
+  cada uno confirme que también lo vio — no se les marca automático.

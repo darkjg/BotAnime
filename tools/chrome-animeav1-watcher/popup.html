@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>AnimeAV1 Watcher</title>
+<style>
+	body { font-family: sans-serif; width: 260px; padding: 10px; }
+	h3 { margin: 0 0 8px; }
+	p { font-size: 0.85em; color: #444; }
+	textarea { width: 100%; box-sizing: border-box; resize: vertical; }
+	button { margin-top: 6px; }
+	#estado { margin-top: 8px; font-size: 0.85em; }
+</style>
+</head>
+<body>
+	<h3>AnimeAV1 Watcher</h3>
+	<p>Pega tu token personal de <code>/vlc-watcher-token</code> (el mismo que usarías para el vigilante de VLC):</p>
+	<textarea id="token" rows="2"></textarea>
+	<button id="guardar">Guardar</button>
+	<div id="estado"></div>
+	<script src="popup.js"></script>
+</body>
+</html>

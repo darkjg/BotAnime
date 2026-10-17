@@ -14,3 +14,13 @@ seasonCache.json
 # No exponer la conexión con Aurora en el repo público (sincroniza gifs de reacción, ver /reaccion)
 src/commands/reaccion.js
 src/services/auroraSync.js
+
+# Herramientas del vigilante: sin binarios, empaquetados ni config con secretos
+tools/**/bin/
+tools/**/obj/
+tools/**/*.zip
+tools/**/*.exe
+tools/**/*.xpi
+tools/**/web-ext-artifacts/
+tools/**/.amo-upload-uuid
+tools/vlc-watcher/config.json

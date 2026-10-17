@@ -1,0 +1,46 @@
+AnimeAV1 Watcher (Chrome) — marca solo los capítulos que ves EN STREAMING en animeav1.com
+=============================================================================================
+
+¿Qué hace? Igual que el vigilante de VLC (../vlc-watcher), pero para cuando ves el capítulo
+directamente en la web de animeav1.com en vez de descargarlo: al llegar casi al final, avisa al bot
+de Discord para que te marque ese capítulo como visto a ti (y a quien esté contigo en tu mismo canal
+de voz que también siga ese anime).
+
+Solo funciona con el servidor "HLS" (el que carga por defecto al abrir un capítulo) y, si el
+servidor en cuestión usa un reproductor de vídeo normal, también con UPNShare/Voe/Byse/MP4Upload -
+confirmado que HLS sí funciona; los demás no se han probado en vivo.
+
+PASO 1 — Consigue tu token (en Discord)
+----------------------------------------
+Escribe /vlc-watcher-token en el servidor (el mismo token sirve para esto y para el vigilante de
+VLC, no hace falta pedir uno nuevo si ya tienes uno).
+
+PASO 2 — Instala la extensión en Chrome
+-------------------------------------------
+Chrome permite "cargar sin empaquetar" de forma permanente, sin necesidad de firmarla ni subirla a
+ningún sitio (a diferencia de Firefox):
+  1. Abre chrome://extensions
+  2. Activa "Modo de desarrollador" (interruptor arriba a la derecha).
+  3. "Cargar descomprimida" > elige esta carpeta (la que tiene manifest.json).
+
+Importante: a diferencia de un .xpi/.crx, Chrome no "copia" estos archivos a ningún sitio - la
+extensión queda enlazada a esta misma carpeta. Descomprímela en un sitio fijo (no en Descargas, no
+en una carpeta temporal) y no la borres ni la muevas después de instalarla, o la extensión dejará de
+funcionar. Si algún día reemplazas estos archivos por una versión más nueva, solo hace falta darle a
+"Actualizar" en chrome://extensions - no hay que volver a cargarla desde cero.
+
+PASO 3 — Pega tu token
+-------------------------
+Clic en el icono de la extensión (al lado de la barra de direcciones; puede estar escondido en el
+menú de extensiones, el icono de la pieza de puzle) y pega el token del paso 1.
+
+Listo. Mientras veas un capítulo en https://animeav1.com/media/.../..., al llegar casi al final se
+marca solo - sin recargar la página ni tocar nada en Discord.
+
+Notas
+-----
+- No hace falta estar en un canal de voz: si no lo estás, se marca solo para ti. Si estás en uno con
+  más gente que también sigue ese anime, el bot les ofrece un botón para que cada uno confirme que
+  también lo vio (no se marca automático).
+- Para ver qué está haciendo: chrome://extensions > esta extensión > "Service worker" (debajo del
+  nombre) abre la consola del background - ahí se ven los avisos mandados/recibidos.
