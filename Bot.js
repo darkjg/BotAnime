@@ -25,6 +25,8 @@ const quitarUsuario = require('./src/commands/quitarUsuario');
 const limpiarNombreHoja = require('./src/commands/limpiarNombreHoja');
 const vlcWatcherToken = require('./src/commands/vlcWatcherToken');
 const { startWatchServer } = require('./src/watchServer');
+const { startSettingsServer } = require('./src/settingsServer');
+const { startFootballCheck } = require('./src/futbolCheck');
 
 const { handleInteraction } = require('./src/interactions');
 const { startAv1EpisodeNotifier, startAuroraGifSync } = require('./src/scheduler');
@@ -106,6 +108,8 @@ client.once('clientReady', () => {
 	startQuedadasNotifier(client);
 	startRemindersNotifier(client);
 	startWatchServer(client);
+	startSettingsServer(client);
+	startFootballCheck(client);
 	pushKumaHeartbeat();
 	setInterval(pushKumaHeartbeat, KUMA_PUSH_INTERVAL_MS);
 });

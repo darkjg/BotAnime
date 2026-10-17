@@ -161,7 +161,26 @@ function getNotificationChannel(guildId) {
 	return getGuildSettingsRow(guildId)?.notificationChannelId ?? null;
 }
 
-function getNotifyWindow(guildId) {
+// Horas de avisos por día de la semana (0 = domingo ... 6 = sábado, como Date#getDay), editables desde la
+// página de ajustes de la Homepage. Se guardan en bot_state como JSON [{startHour,endHour} x7]; un día sin
+// valor usa la ventana del servidor, y start == end deja ese día sin avisos.
+const NOTIFY_DAYS_KEY = 'notifyDayWindows';
+function getNotifyDayWindows() {
+	try {
+		const days = JSON.parse(getBotState(NOTIFY_DAYS_KEY));
+		return Array.isArray(days) && days.length === 7 ? days : null;
+	} catch {
+		return null;
+	}
+}
+
+function setNotifyDayWindows(days) {
+	setBotState(NOTIFY_DAYS_KEY, JSON.stringify(days));
+}
+
+function getNotifyWindow(guildId, date = new Date()) {
+	const day = getNotifyDayWindows()?.[date.getDay()];
+	if (day && Number.isInteger(day.startHour) && Number.isInteger(day.endHour)) return day;
 	const row = getGuildSettingsRow(guildId);
 	if (!row || row.notifyStartHour == null || row.notifyEndHour == null) return DEFAULT_NOTIFY_WINDOW;
 	return { startHour: row.notifyStartHour, endHour: row.notifyEndHour };
@@ -394,6 +413,17 @@ function getLastNotifiedAv1Episode({ seasonLabel, malId, guildId }) {
 
 function setLastNotifiedAv1Episode({ seasonLabel, malId, guildId, episode }) {
 	upsertAv1EntryStmt.run(guildId, seasonLabel, malId, episode, Date.now());
+}
+
+const selectRecentAv1NoticesStmt = db.prepare(`
+	SELECT n.seasonLabel, n.malId, n.episode, n.detectedAt, a.title
+	FROM av1_notified_episodes n
+	JOIN anime a ON a.guildId = n.guildId AND a.seasonLabel = n.seasonLabel AND a.malId = n.malId
+	WHERE n.guildId = ? ORDER BY n.detectedAt DESC LIMIT ?
+`);
+// Últimos episodios avisados del servidor (más reciente primero), para la página de ajustes de la Homepage.
+function listRecentAv1Notices(guildId, limit) {
+	return selectRecentAv1NoticesStmt.all(guildId, limit);
 }
 
 // --- botState ----------------------------------------------------------------------------------------
@@ -897,6 +927,9 @@ module.exports = {
 	setLastNotifiedAv1Episode,
 	isCaughtUpThisWeek,
 	getNotifyWindow,
+	listRecentAv1Notices,
+	getNotifyDayWindows,
+	setNotifyDayWindows,
 	setNotifyWindow,
 	getVoteRole,
 	setVoteRole,

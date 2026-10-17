@@ -114,8 +114,15 @@ async function handleAv1WarpButton(interaction, action) {
 	await interaction.editReply({ content, components: [] });
 }
 
+// Último chequeo de animeav1 (lo muestra la página de ajustes de la Homepage).
+let lastAv1Check = null;
+function getLastAv1Check() {
+	return lastAv1Check;
+}
+
 function onAv1FetchSuccess() {
 	consecutiveFailures = 0;
+	lastAv1Check = { at: Date.now(), ok: true };
 }
 
 // Minutos desde medianoche hasta el límite para mandar el MD automático (ver LAST_CHECKS_COUNT).
@@ -130,6 +137,7 @@ function promptDeadlineMinutes(checkIntervalMs) {
 // segunda falla.
 async function onAv1FetchFailure(client, { checkIntervalMs, at = new Date() }) {
 	consecutiveFailures++;
+	lastAv1Check = { at: Date.now(), ok: false };
 	if (isBackupMode()) return;
 
 	const nowMin = at.getHours() * 60 + at.getMinutes();
@@ -151,4 +159,4 @@ async function onAv1FetchFailure(client, { checkIntervalMs, at = new Date() }) {
 	}
 }
 
-module.exports = { getOwnerId, buildPromptMessage, sendBackupPrompt, handleAv1WarpButton, onAv1FetchSuccess, onAv1FetchFailure };
+module.exports = { getOwnerId, buildPromptRow, buildPromptMessage, sendBackupPrompt, handleAv1WarpButton, onAv1FetchSuccess, onAv1FetchFailure, getLastAv1Check };
