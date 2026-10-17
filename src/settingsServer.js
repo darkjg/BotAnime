@@ -21,6 +21,8 @@ const { checkAndNotifyAv1 } = require('./scheduler');
 const PORT = 3006;
 const ALLOWED_ORIGIN = process.env.HOMEPAGE_ORIGIN || 'http://192.168.1.100:3003';
 const MAX_BODY_BYTES = 4 * 1024;
+// Anti DNS-rebinding: solo se atiende si el Host es el de la Pi (o localhost), no un dominio ajeno que apunte aquí.
+const ALLOWED_HOSTS = new Set([`${new URL(ALLOWED_ORIGIN).hostname}:${PORT}`, `localhost:${PORT}`, `127.0.0.1:${PORT}`]);
 
 function isPrivateIp(address = '') {
 	const ip = address.replace(/^::ffff:/, '');
@@ -159,7 +161,10 @@ function startSettingsServer(client) {
 		};
 
 		if (!isPrivateIp(req.socket.remoteAddress)) return send(403, { error: 'solo red local' });
-		if (req.headers.origin && req.headers.origin !== ALLOWED_ORIGIN) return send(403, { error: 'origen no permitido' });
+		if (!ALLOWED_HOSTS.has(req.headers.host)) return send(403, { error: 'host no permitido' });
+		// Lo que cambia estado exige venir de la Homepage (los navegadores siempre mandan Origin en POST/PUT).
+		const mutates = req.method === 'POST' || req.method === 'PUT';
+		if ((mutates || req.headers.origin) && req.headers.origin !== ALLOWED_ORIGIN) return send(403, { error: 'origen no permitido' });
 		if (req.method === 'OPTIONS') return send(204, {});
 		if (req.url === '/api/estado' && req.method === 'GET') return send(200, buildStatus(client, guildId));
 		if (req.url === '/api/chequear' && req.method === 'POST') {
