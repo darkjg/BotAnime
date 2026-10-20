@@ -11,6 +11,7 @@ const {
 	getLastNotifiedAv1Episode,
 } = require('./services/db');
 const { isBackupMode, setBackupMode, isWarpEnabled, enableWarp, disableWarp } = require('./services/av1Net');
+const { isDnsEncrypted, setDnsEncrypted } = require('./services/dnsProxy');
 const { getLastAv1Check } = require('./av1Backup');
 const { getFootballStatus } = require('./futbolCheck');
 const { checkAndNotifyAv1 } = require('./scheduler');
@@ -166,7 +167,21 @@ function startSettingsServer(client) {
 		const mutates = req.method === 'POST' || req.method === 'PUT';
 		if ((mutates || req.headers.origin) && req.headers.origin !== ALLOWED_ORIGIN) return send(403, { error: 'origen no permitido' });
 		if (req.method === 'OPTIONS') return send(204, {});
-		if (req.url === '/api/estado' && req.method === 'GET') return send(200, buildStatus(client, guildId));
+		if (req.url === '/api/estado' && req.method === 'GET') {
+			const dnsCifrado = await isDnsEncrypted().catch(() => null);
+			return send(200, { ...buildStatus(client, guildId), dnsCifrado });
+		}
+		if (req.url === '/api/dns' && req.method === 'POST') {
+			try {
+				const { action } = await readJson(req);
+				if (action !== 'on' && action !== 'off') return send(400, { error: 'acción inválida' });
+				await setDnsEncrypted(action === 'on');
+				console.log(`[settingsServer] DNS cifrado ${action === 'on' ? 'activado' : 'desactivado'} desde la Homepage`);
+				return send(200, { ok: true, dnsCifrado: action === 'on' });
+			} catch (err) {
+				return send(400, { error: err.message });
+			}
+		}
 		if (req.url === '/api/chequear' && req.method === 'POST') {
 			if (checking) return send(409, { error: 'ya hay un chequeo en curso' });
 			checking = true;
