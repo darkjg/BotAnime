@@ -72,6 +72,8 @@ function resolverMalIdPorTitulo(title) {
 	return match?.malId ?? null;
 }
 
+const avisosRecientes = new Map();
+
 // Marca el capítulo para quien reporta. Al resto de gente que esté en su mismo canal de voz y
 // también siga el anime NO se le marca en automático (antes sí, pero eso también marcaba a quien
 // estaba ahí haciendo otra cosa sin mirar el capítulo) - en vez de eso, se les ofrece un botón para
@@ -153,7 +155,14 @@ async function marcarCapituloParaCanal({ client, discordId, av1MediaId, title, e
 	// confirmación que perder por no usar el canal. Si el DM falla (lo tiene cerrado, por ejemplo) cae
 	// al comportamiento de siempre en vez de perder el aviso en silencio.
 	let avisadoPorDM = false;
-	if (!canalVoz && getAvisoPrivadoPreference(reportante.id)) {
+	// Varios reporteros pueden mandar el mismo capítulo a la vez (VLC, extensión, varias pestañas):
+	// el marcado es idempotente, pero el aviso se manda una sola vez por persona+anime+capítulo.
+	const claveAviso = `${reportante.id}:${malId}:${episode}`;
+	const yaAvisado = avisosRecientes.has(claveAviso);
+	avisosRecientes.set(claveAviso, true);
+	setTimeout(() => avisosRecientes.delete(claveAviso), 10 * 60_000).unref();
+	if (yaAvisado) avisadoPorDM = true; // evita DM y mensaje en canal
+	if (!yaAvisado && !canalVoz && getAvisoPrivadoPreference(reportante.id)) {
 		try {
 			await reportante.send(`📺 Marcaste visto el capítulo ${episode} de **${getDisplayTitle(anime)}**.`);
 			avisadoPorDM = true;
