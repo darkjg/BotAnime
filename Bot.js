@@ -94,10 +94,12 @@ const loginWatchdog = setTimeout(() => {
 
 // Heartbeat para Uptime Kuma: mientras el bot esté conectado y respondiendo, le avisa cada rato. Si el
 // proceso se cuelga o se cae, deja de llegar y Kuma lo marca caído solo.
-const KUMA_PUSH_URL = 'http://192.168.1.100:3002/api/push/60e65c6c98da9cca6418100b22a46f8e?status=up&msg=OK&ping=';
+// La URL de push lleva un token: va en .env (KUMA_PUSH_URL, sin query), no en el código. Sin ella no hay heartbeat.
+const KUMA_PUSH_URL = process.env.KUMA_PUSH_URL;
 const KUMA_PUSH_INTERVAL_MS = 60_000;
 function pushKumaHeartbeat() {
-	fetch(KUMA_PUSH_URL).catch((err) => console.error('[bot] heartbeat a Uptime Kuma falló:', err.message));
+	if (!KUMA_PUSH_URL) return;
+	fetch(`${KUMA_PUSH_URL}?status=up&msg=OK&ping=`).catch((err) => console.error('[bot] heartbeat a Uptime Kuma falló:', err.message));
 }
 
 client.once('clientReady', () => {
