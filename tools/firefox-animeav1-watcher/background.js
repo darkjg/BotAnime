@@ -6,6 +6,7 @@ const BOT_URL = 'https://newjg.chickenkiller.com/vlc-watched';
 
 const episodioPorPestana = new Map(); // tabId -> { mediaId, episodio }
 const yaAvisado = new Set(); // "mediaId:episodio" ya confirmado por el bot, para no repetir
+const enCurso = new Set(); // "mediaId:episodio" con un POST en vuelo
 
 browser.runtime.onMessage.addListener((mensaje, sender) => {
 	const tabId = sender.tab?.id;
@@ -25,6 +26,10 @@ browser.runtime.onMessage.addListener((mensaje, sender) => {
 		}
 		return avisarBot(actual.mediaId, actual.episodio);
 	}
+
+	// Netflix no tiene id de animeav1: content-netflix.js manda directamente el título y el capítulo
+	// y el bot los cruza por título (mismo camino que Erai-raws).
+	if (mensaje.tipo === 'netflix-visto') return avisarBot(null, mensaje.episode, mensaje.title);
 });
 
 browser.tabs.onRemoved.addListener((tabId) => episodioPorPestana.delete(tabId));
@@ -32,9 +37,11 @@ browser.tabs.onRemoved.addListener((tabId) => episodioPorPestana.delete(tabId));
 // Igual que el vigilante de VLC (ver Program.cs/AvisarBot): si el bot respondió (lo haya marcado o
 // no) no tiene sentido reintentar - esa respuesta no va a cambiar. Solo un fallo de red/timeout deja
 // la puerta abierta a que content-player.js lo vuelva a intentar más tarde.
-async function avisarBot(mediaId, episodio) {
-	const clave = `${mediaId}:${episodio}`;
-	if (yaAvisado.has(clave)) return { ok: true };
+async function avisarBot(mediaId, episodio, title = null) {
+	const clave = `${title ?? mediaId}:${episodio}`;
+	// enCurso: content-player.js puede avisar varias veces seguidas (o desde varios iframes) antes de
+	// que responda el bot; sin esto todas pasaban el check de yaAvisado y cada una mandaba su POST.
+	if (yaAvisado.has(clave) || enCurso.has(clave)) return { ok: true };
 
 	const { token } = await browser.storage.local.get('token');
 	if (!token) {
@@ -42,11 +49,12 @@ async function avisarBot(mediaId, episodio) {
 		return { ok: false };
 	}
 
+	enCurso.add(clave);
 	try {
 		const respuesta = await fetch(BOT_URL, {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ token, av1MediaId: mediaId, episode: episodio }),
+			body: JSON.stringify(title ? { token, title, episode: episodio } : { token, av1MediaId: mediaId, episode: episodio }),
 		});
 		const cuerpo = await respuesta.json().catch(() => null);
 		if (!cuerpo) {
@@ -63,5 +71,7 @@ async function avisarBot(mediaId, episodio) {
 	} catch (err) {
 		console.warn('[animeav1-watcher] no pude avisar al bot, se reintentará:', err);
 		return { ok: false };
+	} finally {
+		enCurso.delete(clave);
 	}
 }

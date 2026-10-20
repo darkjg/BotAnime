@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
   "name": "AnimeAV1 Watcher - BotAnime",
-  "version": "1.0.0",
-  "description": "Marca solo los capítulos que ves en streaming en animeav1.com como vistos en el bot de Discord.",
+  "version": "1.1.0",
+  "description": "Marca solo los capítulos que ves en streaming en animeav1.com y Netflix como vistos en el bot de Discord.",
   "permissions": [
     "storage",
     "https://animeav1.com/*",
@@ -11,6 +11,7 @@
     "https://voe.sx/*",
     "https://byselapuix.com/*",
     "https://www.mp4upload.com/*",
+    "https://www.netflix.com/*",
     "https://newjg.chickenkiller.com/*"
   ],
   "background": {
@@ -33,6 +34,11 @@
       ],
       "all_frames": true,
       "js": ["content-player.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://www.netflix.com/*"],
+      "js": ["content-netflix.js"],
       "run_at": "document_idle"
     }
   ],

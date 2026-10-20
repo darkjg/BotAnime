@@ -43,3 +43,11 @@ Notas
   que pase por encima del 90% del capítulo.
 - Para ver qué está haciendo: about:debugging#/runtime/this-firefox > esta extensión > "Inspeccionar"
   (consola del background) muestra los avisos mandados/recibidos.
+
+NETFLIX (desde la versión 1.1.0)
+--------------------------------
+La misma extensión y el mismo token también marcan lo que ves en netflix.com (content-netflix.js):
+lee el título y el "Temporada N: Ep. M" del reproductor y, al 90%, avisa al bot por título. Las
+temporadas > 1 se envían como "<Título> N" (así está en el bot, p.ej. "Cyberpunk: Edgerunners 2").
+Para depurar: consola de la pestaña de Netflix, busca "[netflix-watcher] detectado". Si no sale, el
+selector [data-uia="video-title"] ha cambiado.
