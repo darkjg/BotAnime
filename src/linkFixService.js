@@ -10,7 +10,7 @@ const { AttachmentBuilder } = require('discord.js');
 // resto se descarta (mobile.twitter.com, old.reddit.com...).
 // Twitch clips y Threads no están: no se pudo verificar que sus dominios "fix" existan/respondan.
 const SITIOS = {
-	x: { dominios: ['x\\.com', 'twitter\\.com'], host: 'fixvx.com', keepSub: false, verificar: true },
+	x: { dominios: ['x\\.com', 'twitter\\.com'], host: 'fxtwitter.com', keepSub: false, verificar: true },
 	// tiktokez (EmbedEZ) en vez de tnktok (2026-09-30, portado de Aurora): es de los pocos
 	// servicios que usamos que traduce por URL. Se le añade SIEMPRE /es (ver traducirSiempre más
 	// abajo) porque este bot habla en castellano.
@@ -21,7 +21,7 @@ const SITIOS = {
 	// El vídeo se sigue reproduciendo (sirve og:video).
 	tiktok: { dominios: ['tiktok\\.com'], host: 'tiktokez.com', keepSub: true, traducirSiempre: true },
 	instagram: { dominios: ['instagram\\.com'], host: 'kkinstagram.com', keepSub: false },
-	reddit: { dominios: ['reddit\\.com'], host: 'rxddit.com', keepSub: false },
+	reddit: { dominios: ['reddit\\.com'], host: 'vxreddit.com', keepSub: false },
 	bluesky: { dominios: ['bsky\\.app'], host: 'bskx.app', keepSub: false },
 	// embedPropio: ver construirEmbedDesdeOg. Discord pinta og:site_name como pie del embed, y
 	// phixiv pone ahí la URL de su repo de GitHub, que sale en todos los mensajes. El embed es
@@ -91,6 +91,40 @@ function leerMeta(html, propiedad) {
 	const inverso = html.match(new RegExp(`<meta[^>]+content=["']([^"']*)["'][^>]+property=["']${propiedad}["']`, 'i'));
 	const valor = (directo || inverso)?.[1];
 	return valor ? decodificarEntidades(valor) : null;
+}
+
+// Discord no embebe un video grande servido por redireccion directa (visto con kkinstagram: 302 a un
+// .mp4 de 18 MB y el mensaje se quedaba en link pelado). shortcut: umbral estimado (subido de 10 a 25 MB a peticion del usuario, 2026-11-09), no un limite documentado.
+const MAX_VIDEO_DIRECTO = 25 * 1024 * 1024;
+
+// ¿Devuelve el servicio "fix" algo que Discord pueda convertir en embed? Una respuesta mala = false.
+// Un fallo de RED (la Pi no llega al servicio, p. ej. por el bloqueo de LaLiga a Cloudflare: visto con
+// kkinstagram, 4 de 5 intentos "fetch failed" desde la Pi) se reintenta y, si persiste, se da por buena:
+// Discord consulta el link desde sus propios servidores, asi que no es prueba de que el servicio falle.
+// Portado de Aurora, 2026-11-09.
+async function servicioResponde(url) {
+	for (let intento = 0; intento < 4; intento++) {
+		try {
+			return await comprobarServicio(url);
+		} catch {
+			// red o timeout: reintento
+		}
+	}
+	return true;
+}
+
+async function comprobarServicio(url) {
+	const res = await fetch(url, { headers: { 'User-Agent': UA_CRAWLER }, redirect: 'manual', signal: AbortSignal.timeout(TIMEOUT_OG_MS) });
+	if (res.status >= 300 && res.status < 400) {
+		res.body?.cancel().catch(() => {});
+		const destino = res.headers.get('location');
+		if (!destino) return false;
+		const media = await fetch(new URL(destino, url), { headers: { 'User-Agent': UA_CRAWLER }, signal: AbortSignal.timeout(TIMEOUT_OG_MS) });
+		media.body?.cancel().catch(() => {}); // solo cabeceras: no bajamos el video
+		return media.ok && (Number(media.headers.get('content-length')) || 0) <= MAX_VIDEO_DIRECTO;
+	}
+	if (!res.ok) return false;
+	return /og:(video|image)/i.test(await res.text());
 }
 
 // @returns el embed listo, o null si no se pudo (se cae al link normal).
@@ -348,9 +382,18 @@ async function handleMessage(message) {
 		const infoX = new Map(rutasX.map((ruta, i) => [ruta, analisisX[i]]));
 		marcar(`fxtwitter respondido (${rutasX.length} ruta/s)`);
 
-		const aArreglar = coincidencias
-			.filter((c) => !c.sitio.verificar || infoX.get(c.ruta)?.arreglar)
-			.sort((a, b) => a.index - b.index);
+		// Los demas sitios se reescriben siempre, pero antes se comprueba que el servicio devuelva algo
+		// que Discord pueda pintar: si no, se borraba el original y quedaba un link pelado sin video/imagen.
+		// Si falla, se deja el mensaje original tal cual.
+		const candidatos = coincidencias.filter((c) => !c.sitio.verificar || infoX.get(c.ruta)?.arreglar);
+		const sanos = await Promise.all(candidatos.map(async (c) => {
+			if (c.sitio.verificar || c.sitio.embedPropio) return true; // X ya se verifico; embedPropio cae solo al link
+			const url = `https://${c.sitio.keepSub ? c.sub : ''}${c.sitio.host}${c.sitio.traducirSiempre ? insertarIdioma(c.ruta) : c.ruta}`;
+			const ok = await servicioResponde(url);
+			if (!ok) console.log(`[linkFix] ${c.sitio.host}: ${url} no devolvio og:video/og:image (o el video pesa mas de 25 MB), dejo el link original`);
+			return ok;
+		}));
+		const aArreglar = candidatos.filter((_, i) => sanos[i]).sort((a, b) => a.index - b.index);
 
 		// Ninguno de los links necesita el reemplazo: se deja el mensaje original tal cual.
 		if (aArreglar.length === 0) return;
